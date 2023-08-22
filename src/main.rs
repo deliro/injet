@@ -1,0 +1,552 @@
+use std::fmt::{Display, Formatter};
+use std::fs::File;
+use std::io::Write;
+use std::io::{stdout, BufReader, BufWriter, IsTerminal, Read};
+use std::path::PathBuf;
+use std::{fs, io, mem};
+
+use ascii_table::AsciiTable;
+use clap::{arg, Args, Parser, Subcommand, ValueEnum};
+use human_panic::setup_panic;
+use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+use image::{ColorType, EncodableLayout, GenericImageView, ImageEncoder, Rgba};
+use itertools::Itertools;
+
+#[derive(Parser)]
+#[command(author, version, about, long_about)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Injects a file into an image. If the image is not PNG/RGBA8, it will be converted
+    Inject(InjectArgs),
+
+    /// Extracts a file from an image
+    Extract(ExtractArgs),
+
+    /// Inspects an image if it has a file inside and prints the results.
+    /// Also tells how large a file can be injected inside
+    Inspect(InspectArgs),
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
+enum Compression {
+    Default,
+    Fast,
+    Best,
+}
+
+impl Into<CompressionType> for Compression {
+    fn into(self) -> CompressionType {
+        match self {
+            Compression::Default => CompressionType::Default,
+            Compression::Fast => CompressionType::Fast,
+            Compression::Best => CompressionType::Best,
+        }
+    }
+}
+
+#[derive(Args)]
+struct InjectArgs {
+    /// The file to inject
+    cargo: PathBuf,
+
+    /// The image (container)
+    container: PathBuf,
+
+    /// Destination, where the injected file is placed
+    #[arg(short, long)]
+    destination: Option<PathBuf>,
+
+    /// Whether to write metadata. If not set, extracting would require --read-meta=false
+    /// and the exact file size in bytes (--read-size)
+    #[arg(short, long, default_value_t = true, action = clap::ArgAction::Set)]
+    write_meta: bool,
+
+    /// Compression level used to compress PNG
+    #[arg(value_enum, long, default_value_t = Compression::Default)]
+    compression: Compression,
+}
+
+#[derive(Args)]
+struct ExtractArgs {
+    /// Container that contains a file
+    container: PathBuf,
+
+    /// Where to save the extracted file. If not set, the filename will be read
+    /// from metadata (if any). If none are set, defaults to "cargo"
+    #[arg(short, long)]
+    destination: Option<PathBuf>,
+
+    /// Whether to read metadata. If metadata was not written and --read-meta=true,
+    /// extraction will fail. If metadata was written and --read-meta=false,
+    /// the extracted file will be broken
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    read_meta: bool,
+
+    /// How many bytes of the cargo file to read. Defaults to the value in metadata.
+    /// If none, defaults to the maximum (until the container ends)
+    #[arg(long)]
+    read_size: Option<u32>,
+}
+
+#[derive(Args)]
+struct InspectArgs {
+    /// Container file
+    path: PathBuf,
+}
+
+const KB: u32 = 1024;
+const MB: u32 = 1024 * 1024;
+const MB_MINUS_1: u32 = MB - 1;
+const GB: u32 = MB * 1024;
+const GB_MINUS_1: u32 = GB - 1;
+
+#[inline]
+fn format_size(size: u32) -> String {
+    match size {
+        (GB..=u32::MAX) => format!("{:.2} GB", (size as f32) / (GB as f32)),
+        (MB..=GB_MINUS_1) => format!("{:.2} MB", (size as f32) / (MB as f32)),
+        (KB..=MB_MINUS_1) => format!("{:.2} KB", (size as f32) / (KB as f32)),
+        _ => format!("{size} bytes"),
+    }
+}
+
+#[inline]
+fn to_bits(val: u8) -> [u8; 8] {
+    [
+        (val >> 7) & 1,
+        (val >> 6) & 1,
+        (val >> 5) & 1,
+        (val >> 4) & 1,
+        (val >> 3) & 1,
+        (val >> 2) & 1,
+        (val >> 1) & 1,
+        (val >> 0) & 1,
+    ]
+}
+
+#[inline]
+fn iter_dots(w: u32, h: u32) -> impl Iterator<Item = (u32, u32)> {
+    (0..w).cartesian_product(0..h)
+}
+
+const MAGIC: u16 = 0xd2d;
+const VERSION: u8 = 1;
+#[derive(Debug, Eq, PartialEq)]
+struct Meta {
+    version: u8,
+    size: u32,
+    filename_size: Option<u8>,
+    filename: Option<String>,
+}
+
+impl Meta {
+    fn to_bytes(&self) -> Vec<u8> {
+        // 2 bytes signature + version
+        // 4 bytes file size
+        // 1 byte filename size (if any)
+        // X bytes filename (X < 255)
+        let signature = (MAGIC << 3) | (self.version as u16);
+        let first_two = unsafe { mem::transmute::<u16, [u8; 2]>(signature) };
+        let size_bytes = unsafe { mem::transmute::<u32, [u8; 4]>(self.size) };
+        let (filename_size, has_filename): (u8, _) = match &self.filename {
+            None => (0b11111111, false),
+            Some(v) => (v.len() as u8, true),
+        };
+        let mut result = vec![];
+        result.extend(first_two);
+        result.extend(size_bytes.into_iter().rev());
+        result.push(filename_size);
+        if has_filename {
+            result.extend(self.filename.clone().unwrap().into_bytes())
+        }
+        result
+    }
+
+    fn to_bits(&self) -> Vec<u8> {
+        self.to_bytes().into_iter().flat_map(to_bits).collect()
+    }
+
+    fn make(size: u32, filename: Option<String>) -> Self {
+        let filename_size = match &filename {
+            None => None,
+            Some(v) => Some(v.len() as u8),
+        };
+        Self {
+            version: VERSION,
+            size,
+            filename_size,
+            filename,
+        }
+    }
+}
+
+// sadly, this cannot be implemented as a plain TryFrom trait
+// https://github.com/rust-lang/rust/issues/50133
+struct Wrapper<T>(T);
+impl<T> TryFrom<Wrapper<&mut T>> for Meta
+where
+    T: Iterator<Item = u8>,
+{
+    type Error = MetaError;
+
+    fn try_from(wrapper: Wrapper<&mut T>) -> Result<Self, Self::Error> {
+        let value = wrapper.0;
+        let header = value.take(7).collect_vec();
+        if header.len() != 7 {
+            return Err(MetaError::NoBytes);
+        }
+
+        let signature: u16 = ((header[0] as u16) << 8) + (header[1] as u16);
+        let sign = signature >> 3;
+        if sign != MAGIC {
+            return Err(MetaError::SignatureMismatch);
+        }
+
+        let version = (signature & 0b111) as u8;
+        if version != VERSION {
+            return Err(MetaError::UnsupportedVersion(version));
+        }
+
+        let size = header
+            .iter()
+            .skip(2)
+            .take(4)
+            .zip([24, 16, 8, 0])
+            .map(|(val, shift)| (*val as u32) << shift)
+            .sum();
+        let filename_size = match header[6] {
+            0b11111111 => None,
+            sz => Some(sz),
+        };
+
+        let mut filename = None;
+        if let Some(sz) = filename_size {
+            let filename_vec = value.take(sz as usize).collect_vec();
+            if filename_vec.len() as u8 != sz {
+                return Err(MetaError::MalformedFilename);
+            }
+            let filename_lossy = String::from_utf8_lossy(&filename_vec);
+            filename = Some(filename_lossy.to_string());
+        }
+
+        Ok(Self {
+            version: 1,
+            size,
+            filename_size,
+            filename,
+        })
+    }
+}
+
+enum MetaError {
+    NoBytes,
+    SignatureMismatch,
+    UnsupportedVersion(u8),
+    MalformedFilename,
+}
+
+impl Display for MetaError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MetaError::NoBytes => f.write_str("not enough bytes to build the meta"),
+            MetaError::SignatureMismatch => f.write_str("signature mismatch"),
+            MetaError::UnsupportedVersion(v) => {
+                f.write_str(&format!("version {} isn't supported", v))
+            }
+            MetaError::MalformedFilename => f.write_str("error reading cargo filename"),
+        }
+    }
+}
+
+enum InspectError {
+    FileNotExist,
+    NotAnImage,
+    NotAFile,
+}
+
+impl Display for InspectError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InspectError::FileNotExist => f.write_str("file doesn't exist"),
+            InspectError::NotAnImage => f.write_str("file is not an image"),
+            InspectError::NotAFile => f.write_str("not a file"),
+        }
+    }
+}
+
+fn inspect(args: InspectArgs) -> Result<(), InspectError> {
+    if !args.path.exists() {
+        return Err(InspectError::FileNotExist);
+    }
+
+    if !args.path.is_file() {
+        return Err(InspectError::NotAFile);
+    }
+
+    let filename = (&args)
+        .path
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let img = image::open(&args.path).map_err(|_| InspectError::NotAnImage)?;
+    let (w, h) = img.dimensions();
+    let max_cargo_size = format_size((w * h * 4) / 8);
+    let bytes = iter_dots(w, h)
+        .flat_map(|(x, y)| img.get_pixel(x, y).0)
+        .map(|v| v & 1)
+        .chunks(8);
+    let mut content = bytes.into_iter().map(|chunk| {
+        chunk
+            .zip((0..8).rev())
+            .map(|(bit, shift)| bit << shift)
+            .sum()
+    });
+    let meta = Meta::try_from(Wrapper(&mut content)).ok();
+
+    let ascii_table = AsciiTable::default();
+    let dimensions_fmt = format!("{w}x{h}");
+    let mut table_data: Vec<[String; 2]> = vec![
+        ["filename".to_string(), filename],
+        ["dimensions".to_string(), dimensions_fmt],
+        ["max cargo size".to_string(), max_cargo_size],
+    ];
+
+    match meta {
+        None => table_data.push([
+            "doesn't seem it contains any cargo".to_string(),
+            "".to_string(),
+        ]),
+        Some(v) => {
+            let cargo_filename = v.filename.unwrap_or(String::from("<unnamed>"));
+            let cargo_size = format_size(v.size);
+            table_data.push(["cargo filename".to_string(), cargo_filename]);
+            table_data.push(["cargo size".to_string(), cargo_size]);
+        }
+    }
+    ascii_table.print(table_data);
+    Ok(())
+}
+
+enum ExtractError {
+    ContainerOpen,
+    Save,
+    BrokenMeta(String),
+}
+
+impl Display for ExtractError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExtractError::ContainerOpen => f.write_str("cannot open the container file"),
+            ExtractError::Save => f.write_str("cannot save to the destination"),
+            ExtractError::BrokenMeta(v) => f.write_str(&format!("meta is broken: {v}")),
+        }
+    }
+}
+
+fn extract(args: ExtractArgs) -> Result<(), ExtractError> {
+    let img = image::open(&args.container).map_err(|_| ExtractError::ContainerOpen)?;
+    let (w, h) = img.dimensions();
+    let bytes = iter_dots(w, h)
+        .flat_map(|(x, y)| img.get_pixel(x, y).0)
+        .map(|v| v & 1)
+        .chunks(8);
+    let mut content = bytes.into_iter().map(|chunk| {
+        chunk
+            .zip((0..8).rev())
+            .map(|(bit, shift)| bit << shift)
+            .sum()
+    });
+    let meta = if args.read_meta {
+        Some(
+            Meta::try_from(Wrapper(&mut content))
+                .map_err(|e| ExtractError::BrokenMeta(e.to_string()))?,
+        )
+    } else {
+        None
+    };
+
+    let (meta_filename, size) = if let Some(Meta { filename, size, .. }) = meta {
+        (filename.map(|v| PathBuf::from(v)), Some(size))
+    } else {
+        (None, None)
+    };
+
+    let dest = args
+        .destination
+        .or(meta_filename)
+        .unwrap_or(PathBuf::from("cargo"));
+
+    let read_size = args.read_size.or(size).unwrap_or(u32::MAX);
+    fs::write(dest, content.take(read_size as usize).collect_vec()).map_err(|_| ExtractError::Save)
+}
+
+enum InjectError {
+    CannotOpenContainer,
+    CannotOpenCargo,
+    ExceededSize {
+        available: u32,
+        cargo_size: u32,
+        meta_size: u32,
+    },
+    CannotSave(String),
+    FilenameOverflow,
+}
+
+impl Display for InjectError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InjectError::CannotOpenContainer => f.write_str("cannot open container file"),
+            InjectError::CannotOpenCargo => f.write_str("cannot open cargo file"),
+            InjectError::ExceededSize {
+                available,
+                cargo_size,
+                meta_size,
+            } => f.write_str(&format!(
+                "cannot inject cargo. available size: {}, cargo size: {} + meta size: {}",
+                format_size(*available),
+                format_size(*cargo_size),
+                format_size(*meta_size),
+            )),
+            InjectError::CannotSave(v) => {
+                f.write_str(&format!("cannot save destination file: {v}"))
+            }
+            InjectError::FilenameOverflow => {
+                f.write_str("filename must be less than 255 bytes length")
+            }
+        }
+    }
+}
+
+fn inject(args: InjectArgs) -> Result<(), InjectError> {
+    let mut img = image::open(&args.container)
+        .map_err(|_| InjectError::CannotOpenContainer)?
+        .into_rgba8();
+
+    let cargo = File::open(&args.cargo).map_err(|_| InjectError::CannotOpenCargo)?;
+    let (w, h) = img.dimensions();
+    let max_cargo_size = (w * h * 4) / 8;
+    let cargo_meta = cargo.metadata().map_err(|_| InjectError::CannotOpenCargo)?;
+    let cargo_size = cargo_meta.len() as u32;
+    let mut meta_bits = vec![];
+
+    if args.write_meta {
+        let filename = (&args.cargo)
+            .file_name()
+            .map(|v| String::from(v.to_string_lossy()));
+        if let Some(v) = &filename {
+            if v.as_bytes().len() >= 255 {
+                return Err(InjectError::FilenameOverflow);
+            }
+        }
+        let meta = Meta::make(cargo_size, filename);
+        meta_bits.extend(meta.to_bits());
+    }
+
+    let meta_size = (meta_bits.len() / 8) as u32;
+    let total_size = cargo_size + meta_size; // todo: add crc32 check
+    let required_pixels = (total_size * 8) / 4;
+    if total_size > max_cargo_size {
+        return Err(InjectError::ExceededSize {
+            available: max_cargo_size,
+            cargo_size,
+            meta_size,
+        });
+    }
+
+    let cargo_bits = BufReader::new(cargo)
+        .bytes()
+        .flat_map(|x| to_bits(x.unwrap()));
+    // [(r, g, b, a), (r, g, b, a)] turns into flat [r, g, b, a, r, g, b, a]
+    let colors = iter_dots(w, h)
+        .take(required_pixels as usize)
+        .flat_map(|(x, y)| img.get_pixel(x, y).0)
+        .collect_vec();
+    let binding = meta_bits
+        .into_iter()
+        .chain(cargo_bits.into_iter())
+        .zip(colors)
+        .map(|(bit, color)| ((color & 0b11111110) | bit))
+        .chunks(4);
+
+    let new_pixels = binding.into_iter().map(|chunk| {
+        let colors: [u8; 4] = chunk.collect_vec().try_into().unwrap();
+        Rgba::from(colors)
+    });
+
+    iter_dots(w, h)
+        .zip(new_pixels)
+        .for_each(|((x, y), pixel)| img.put_pixel(x, y, pixel));
+
+    let writer = make_writer(&args)?;
+    let encoder =
+        PngEncoder::new_with_quality(writer, args.compression.into(), FilterType::default());
+    encoder
+        .write_image(img.as_bytes(), w, h, ColorType::Rgba8)
+        .map_err(|e| InjectError::CannotSave(e.to_string()))
+}
+
+fn make_writer(args: &InjectArgs) -> Result<Box<dyn Write>, InjectError> {
+    let writer = if !stdout().is_terminal() && args.destination.is_none() {
+        Box::new(stdout()) as Box<dyn Write>
+    } else {
+        let dest = args
+            .destination
+            .clone()
+            .unwrap_or(PathBuf::from("modified.png"));
+        let write_file =
+            BufWriter::new(File::create(dest).map_err(|e| InjectError::CannotSave(e.to_string()))?);
+        Box::new(write_file) as Box<dyn Write>
+    };
+    Ok(writer)
+}
+
+fn main() -> io::Result<()> {
+    setup_panic!();
+    let cli = Cli::parse();
+    match cli.command {
+        Commands::Inject(args) => {
+            if let Err(e) = inject(args) {
+                eprintln!("{e}");
+                std::process::exit(1)
+            }
+        }
+        Commands::Extract(args) => {
+            if let Err(e) = extract(args) {
+                eprintln!("{e}");
+                std::process::exit(1)
+            }
+        }
+        Commands::Inspect(args) => {
+            if let Err(e) = inspect(args) {
+                eprintln!("inspect error: {e}")
+            }
+        }
+    };
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::assert_eq;
+
+    use crate::{Meta, Wrapper};
+
+    #[test]
+    fn meta_test() {
+        let meta = Meta::make(1231234, Some("hello.zip".to_string()));
+        let mut bytes = meta.to_bytes().into_iter();
+
+        match Meta::try_from(Wrapper(&mut bytes)) {
+            Err(_) => assert!(false, "meta wasn't read"),
+            Ok(v) => assert_eq!(v, meta, "received meta differs"),
+        }
+
+        assert_eq!(bytes.next(), None);
+    }
+}
