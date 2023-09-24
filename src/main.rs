@@ -1,9 +1,10 @@
+use std::borrow::Cow;
 use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::io::Write;
 use std::io::{stdout, BufReader, BufWriter, IsTerminal, Read};
 use std::path::PathBuf;
-use std::{fs, io, mem};
+use std::{fs, io};
 
 use ascii_table::AsciiTable;
 use clap::{arg, Args, Parser, Subcommand, ValueEnum};
@@ -39,9 +40,9 @@ enum Compression {
     Best,
 }
 
-impl Into<CompressionType> for Compression {
-    fn into(self) -> CompressionType {
-        match self {
+impl From<Compression> for CompressionType {
+    fn from(val: Compression) -> Self {
+        match val {
             Compression::Default => CompressionType::Default,
             Compression::Fast => CompressionType::Fast,
             Compression::Best => CompressionType::Best,
@@ -125,7 +126,7 @@ fn to_bits(val: u8) -> [u8; 8] {
         (val >> 3) & 1,
         (val >> 2) & 1,
         (val >> 1) & 1,
-        (val >> 0) & 1,
+        val & 1,
     ]
 }
 
@@ -151,15 +152,13 @@ impl Meta {
         // 1 byte filename size (if any)
         // X bytes filename (X < 255)
         let signature = (MAGIC << 3) | (self.version as u16);
-        let first_two = unsafe { mem::transmute::<u16, [u8; 2]>(signature) };
-        let size_bytes = unsafe { mem::transmute::<u32, [u8; 4]>(self.size) };
         let (filename_size, has_filename): (u8, _) = match &self.filename {
             None => (0b11111111, false),
             Some(v) => (v.len() as u8, true),
         };
-        let mut result = vec![];
-        result.extend(first_two);
-        result.extend(size_bytes.into_iter().rev());
+        let mut result = Vec::with_capacity(7);
+        result.extend(signature.to_le_bytes());
+        result.extend(self.size.to_le_bytes());
         result.push(filename_size);
         if has_filename {
             result.extend(self.filename.clone().unwrap().into_bytes())
@@ -167,15 +166,12 @@ impl Meta {
         result
     }
 
-    fn to_bits(&self) -> Vec<u8> {
-        self.to_bytes().into_iter().flat_map(to_bits).collect()
+    fn to_bits(&self) -> impl Iterator<Item = u8> {
+        self.to_bytes().into_iter().flat_map(to_bits)
     }
 
     fn make(size: u32, filename: Option<String>) -> Self {
-        let filename_size = match &filename {
-            None => None,
-            Some(v) => Some(v.len() as u8),
-        };
+        let filename_size = filename.as_ref().map(|v| v.len() as u8);
         Self {
             version: VERSION,
             size,
@@ -200,8 +196,7 @@ where
         if header.len() != 7 {
             return Err(MetaError::NoBytes);
         }
-
-        let signature: u16 = ((header[0] as u16) << 8) + (header[1] as u16);
+        let signature = u16::from_le_bytes(header[0..2].try_into().unwrap());
         let sign = signature >> 3;
         if sign != MAGIC {
             return Err(MetaError::SignatureMismatch);
@@ -212,13 +207,7 @@ where
             return Err(MetaError::UnsupportedVersion(version));
         }
 
-        let size = header
-            .iter()
-            .skip(2)
-            .take(4)
-            .zip([24, 16, 8, 0])
-            .map(|(val, shift)| (*val as u32) << shift)
-            .sum();
+        let size = u32::from_le_bytes(header[2..6].try_into().unwrap());
         let filename_size = match header[6] {
             0b11111111 => None,
             sz => Some(sz),
@@ -288,12 +277,7 @@ fn inspect(args: InspectArgs) -> Result<(), InspectError> {
         return Err(InspectError::NotAFile);
     }
 
-    let filename = (&args)
-        .path
-        .file_name()
-        .unwrap()
-        .to_string_lossy()
-        .to_string();
+    let filename = args.path.file_name().unwrap().to_string_lossy().to_string();
     let img = image::open(&args.path).map_err(|_| InspectError::NotAnImage)?;
     let (w, h) = img.dimensions();
     let max_cargo_size = format_size((w * h * 4) / 8);
@@ -311,22 +295,19 @@ fn inspect(args: InspectArgs) -> Result<(), InspectError> {
 
     let ascii_table = AsciiTable::default();
     let dimensions_fmt = format!("{w}x{h}");
-    let mut table_data: Vec<[String; 2]> = vec![
-        ["filename".to_string(), filename],
-        ["dimensions".to_string(), dimensions_fmt],
-        ["max cargo size".to_string(), max_cargo_size],
+    let mut table_data = vec![
+        ["filename".into(), Cow::from(&filename)],
+        ["dimensions".into(), dimensions_fmt.into()],
+        ["max cargo size".into(), max_cargo_size.into()],
     ];
 
     match meta {
-        None => table_data.push([
-            "doesn't seem it contains any cargo".to_string(),
-            "".to_string(),
-        ]),
+        None => table_data.push(["doesn't seem it contains any cargo".into(), "".into()]),
         Some(v) => {
             let cargo_filename = v.filename.unwrap_or(String::from("<unnamed>"));
             let cargo_size = format_size(v.size);
-            table_data.push(["cargo filename".to_string(), cargo_filename]);
-            table_data.push(["cargo size".to_string(), cargo_size]);
+            table_data.push(["cargo filename".into(), cargo_filename.into()]);
+            table_data.push(["cargo size".into(), cargo_size.into()]);
         }
     }
     ascii_table.print(table_data);
@@ -372,7 +353,7 @@ fn extract(args: ExtractArgs) -> Result<(), ExtractError> {
     };
 
     let (meta_filename, size) = if let Some(Meta { filename, size, .. }) = meta {
-        (filename.map(|v| PathBuf::from(v)), Some(size))
+        (filename.map(PathBuf::from), Some(size))
     } else {
         (None, None)
     };
@@ -383,6 +364,7 @@ fn extract(args: ExtractArgs) -> Result<(), ExtractError> {
         .unwrap_or(PathBuf::from("cargo"));
 
     let read_size = args.read_size.or(size).unwrap_or(u32::MAX);
+    // TODO: avoid collecting a vector, use buffered write directly from the iterator
     fs::write(dest, content.take(read_size as usize).collect_vec()).map_err(|_| ExtractError::Save)
 }
 
@@ -436,7 +418,8 @@ fn inject(args: InjectArgs) -> Result<(), InjectError> {
     let mut meta_bits = vec![];
 
     if args.write_meta {
-        let filename = (&args.cargo)
+        let filename = args
+            .cargo
             .file_name()
             .map(|v| String::from(v.to_string_lossy()));
         if let Some(v) = &filename {
@@ -469,7 +452,7 @@ fn inject(args: InjectArgs) -> Result<(), InjectError> {
         .collect_vec();
     let binding = meta_bits
         .into_iter()
-        .chain(cargo_bits.into_iter())
+        .chain(cargo_bits)
         .zip(colors)
         .map(|(bit, color)| ((color & 0b11111110) | bit))
         .chunks(4);
