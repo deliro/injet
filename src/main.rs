@@ -1,10 +1,10 @@
 use std::borrow::Cow;
 use std::fmt::{Display, Formatter};
 use std::fs::File;
+use std::io;
 use std::io::Write;
 use std::io::{stdout, BufReader, BufWriter, IsTerminal, Read};
 use std::path::PathBuf;
-use std::{fs, io};
 
 use ascii_table::AsciiTable;
 use clap::{arg, Args, Parser, Subcommand, ValueEnum};
@@ -364,8 +364,13 @@ fn extract(args: ExtractArgs) -> Result<(), ExtractError> {
         .unwrap_or(PathBuf::from("cargo"));
 
     let read_size = args.read_size.or(size).unwrap_or(u32::MAX);
-    // TODO: avoid collecting a vector, use buffered write directly from the iterator
-    fs::write(dest, content.take(read_size as usize).collect_vec()).map_err(|_| ExtractError::Save)
+    let file = File::create(dest).map_err(|_| ExtractError::Save)?;
+    let mut writer = BufWriter::new(file);
+    for b in content.take(read_size as usize) {
+        writer.write_all(&[b]).map_err(|_| ExtractError::Save)?
+    }
+    writer.flush().map_err(|_| ExtractError::Save)?;
+    Ok(())
 }
 
 enum InjectError {
