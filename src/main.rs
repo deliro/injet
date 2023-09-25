@@ -5,6 +5,7 @@ use std::io;
 use std::io::Write;
 use std::io::{stdout, BufReader, BufWriter, IsTerminal, Read};
 use std::path::PathBuf;
+use std::process::exit;
 
 use ascii_table::AsciiTable;
 use clap::{arg, Args, Parser, Subcommand, ValueEnum};
@@ -181,17 +182,15 @@ impl Meta {
     }
 }
 
-// sadly, this cannot be implemented as a plain TryFrom trait
-// https://github.com/rust-lang/rust/issues/50133
-struct Wrapper<T>(T);
-impl<T> TryFrom<Wrapper<&mut T>> for Meta
+// https://github.com/Ixrec/rust-orphan-rules
+struct W<T>(T);
+impl<T> TryFrom<W<&mut T>> for Meta
 where
     T: Iterator<Item = u8>,
 {
     type Error = MetaError;
 
-    fn try_from(wrapper: Wrapper<&mut T>) -> Result<Self, Self::Error> {
-        let value = wrapper.0;
+    fn try_from(W(value): W<&mut T>) -> Result<Self, Self::Error> {
         let header = value.take(7).collect_vec();
         if header.len() != 7 {
             return Err(MetaError::NoBytes);
@@ -224,7 +223,7 @@ where
         }
 
         Ok(Self {
-            version: 1,
+            version,
             size,
             filename_size,
             filename,
@@ -291,8 +290,7 @@ fn inspect(args: InspectArgs) -> Result<(), InspectError> {
             .map(|(bit, shift)| bit << shift)
             .sum()
     });
-    let meta = Meta::try_from(Wrapper(&mut content)).ok();
-
+    let meta = Meta::try_from(W(&mut content)).ok();
     let ascii_table = AsciiTable::default();
     let dimensions_fmt = format!("{w}x{h}");
     let mut table_data = vec![
@@ -344,10 +342,7 @@ fn extract(args: ExtractArgs) -> Result<(), ExtractError> {
             .sum()
     });
     let meta = if args.read_meta {
-        Some(
-            Meta::try_from(Wrapper(&mut content))
-                .map_err(|e| ExtractError::BrokenMeta(e.to_string()))?,
-        )
+        Some(Meta::try_from(W(&mut content)).map_err(|e| ExtractError::BrokenMeta(e.to_string()))?)
     } else {
         None
     };
@@ -497,25 +492,14 @@ fn make_writer(args: &InjectArgs) -> Result<Box<dyn Write>, InjectError> {
 fn main() -> io::Result<()> {
     setup_panic!();
     let cli = Cli::parse();
-    match cli.command {
-        Commands::Inject(args) => {
-            if let Err(e) = inject(args) {
-                eprintln!("{e}");
-                std::process::exit(1)
-            }
-        }
-        Commands::Extract(args) => {
-            if let Err(e) = extract(args) {
-                eprintln!("{e}");
-                std::process::exit(1)
-            }
-        }
-        Commands::Inspect(args) => {
-            if let Err(e) = inspect(args) {
-                eprintln!("inspect error: {e}")
-            }
-        }
-    };
+    if let Err(e) = match cli.command {
+        Commands::Inject(args) => inject(args).map_err(|e| e.to_string()),
+        Commands::Extract(args) => extract(args).map_err(|e| e.to_string()),
+        Commands::Inspect(args) => inspect(args).map_err(|e| e.to_string()),
+    } {
+        eprintln!("{e}");
+        exit(1);
+    }
     Ok(())
 }
 
@@ -523,14 +507,14 @@ fn main() -> io::Result<()> {
 mod tests {
     use std::assert_eq;
 
-    use crate::{Meta, Wrapper};
+    use crate::{Meta, W};
 
     #[test]
     fn meta_test() {
         let meta = Meta::make(1231234, Some("hello.zip".to_string()));
         let mut bytes = meta.to_bytes().into_iter();
 
-        match Meta::try_from(Wrapper(&mut bytes)) {
+        match Meta::try_from(W(&mut bytes)) {
             Err(_) => assert!(false, "meta wasn't read"),
             Ok(v) => assert_eq!(v, meta, "received meta differs"),
         }
