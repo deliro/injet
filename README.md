@@ -1,34 +1,55 @@
 # Injet
 
-#### Overview
+## Overview
 
-Injet is a versatile command-line program designed to perform seamless file 
-injection and extraction within PNG images using the Least Significant Bit (LSB) method.
+Injet is a command-line tool that allows embedding arbitrary files into PNG images using the Least Significant Bit (LSB) method.  
+It can also retrieve embedded files and inspect image capacity for embedded data.
 
+This tool is intended for educational, archival, and personal data embedding use cases.
 
-#### Usage
+## Installation
 
-##### Injecting a file
+To install Injet using Cargo:
 
-To hide a file within a PNG image, employ the following command:
+```bash
+cargo install injet
+```
 
-`injet insert some_file.txt some_image.png > result.png`
+## Usage
 
-*if the image is not a PNG and/or uses a different color scheme than RGBA8, 
-it will be converted automatically*
+### Embedding a file
 
-##### Extracting a file
+To embed a file into a PNG image:
 
-To extract a file, use the following command:
+```bash
+injet inject some_file.txt some_image.png > output.png
+```
 
-`injet extract result.png`
+*If the image is not a PNG or uses a different color format than RGBA8,  
+it will be automatically converted.*
 
-The file `some_file.txt` will be created in the current directory
+### Extracting a file
 
+To extract an embedded file from an image:
 
-##### Inspecting an image
+```bash
+injet extract output.png
+```
 
-To get an information if the image contains a file inside and the maximum possible
-size the image can contain, use the following:
+This will create the original file (e.g., `some_file.txt`) in the current directory.
 
-`injet inspect image.png`
+### Inspecting an image
+
+To check whether an image contains embedded data and to see the maximum supported file size:
+
+```bash
+injet inspect image.png
+```
+
+### Command-line help
+
+You can always see available commands and options using:
+
+```bash
+injet --help
+```

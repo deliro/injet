@@ -1,6 +1,6 @@
 [package]
 name = "injet"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Inject and extract files into PNG images using LSB (Least Significant Bit) method"
 license = "MIT"

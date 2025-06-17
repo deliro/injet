@@ -426,7 +426,7 @@ dependencies = [
 
 [[package]]
 name = "injet"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ascii_table",
  "blake3",

@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io;
 use std::io::Write;
 use std::io::{stdout, BufReader, BufWriter, IsTerminal, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::exit;
 
 use ascii_table::AsciiTable;
@@ -367,6 +367,17 @@ impl Display for ExtractError {
     }
 }
 
+fn make_writer(dest: Option<&Path>, default: impl AsRef<Path>) -> Result<Box<dyn Write>, String> {
+    let writer = if !stdout().is_terminal() && dest.is_none() {
+        Box::new(stdout()) as Box<dyn Write>
+    } else {
+        let dest = dest.unwrap_or(default.as_ref());
+        let write_file = BufWriter::new(File::create(dest).map_err(|e| e.to_string())?);
+        Box::new(write_file) as Box<dyn Write>
+    };
+    Ok(writer)
+}
+
 fn extract(args: ExtractArgs) -> Result<(), ExtractError> {
     let img = image::open(&args.container).map_err(|_| ExtractError::ContainerOpen)?;
     let (w, h) = img.dimensions();
@@ -392,14 +403,12 @@ fn extract(args: ExtractArgs) -> Result<(), ExtractError> {
         (None, None)
     };
 
-    let dest = args
-        .destination
-        .or(meta_filename)
-        .unwrap_or(PathBuf::from("cargo"));
-
     let read_size = args.read_size.or(size).unwrap_or(u32::MAX);
-    let file = File::create(dest).map_err(|_| ExtractError::Save)?;
-    let mut writer = BufWriter::new(file);
+    let mut writer = make_writer(
+        args.destination.as_deref(),
+        meta_filename.unwrap_or(PathBuf::from("cargo")),
+    )
+    .map_err(|_| ExtractError::Save)?;
     for b in content.take(read_size as usize) {
         writer.write_all(&[b]).map_err(|_| ExtractError::Save)?
     }
@@ -505,27 +514,13 @@ fn inject(args: InjectArgs) -> Result<(), InjectError> {
         .zip(new_pixels)
         .for_each(|((x, y), pixel)| img.put_pixel(x, y, pixel));
 
-    let writer = make_writer(&args)?;
+    let writer = make_writer(args.destination.as_deref(), "modified.png")
+        .map_err(InjectError::CannotSave)?;
     let encoder =
         PngEncoder::new_with_quality(writer, args.compression.into(), FilterType::default());
     encoder
         .write_image(img.as_bytes(), w, h, ColorType::Rgba8)
         .map_err(|e| InjectError::CannotSave(e.to_string()))
-}
-
-fn make_writer(args: &InjectArgs) -> Result<Box<dyn Write>, InjectError> {
-    let writer = if !stdout().is_terminal() && args.destination.is_none() {
-        Box::new(stdout()) as Box<dyn Write>
-    } else {
-        let dest = args
-            .destination
-            .clone()
-            .unwrap_or(PathBuf::from("modified.png"));
-        let write_file =
-            BufWriter::new(File::create(dest).map_err(|e| InjectError::CannotSave(e.to_string()))?);
-        Box::new(write_file) as Box<dyn Write>
-    };
-    Ok(writer)
 }
 
 fn main() -> io::Result<()> {
