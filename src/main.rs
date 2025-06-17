@@ -9,10 +9,16 @@ use std::process::exit;
 
 use ascii_table::AsciiTable;
 use clap::{arg, Args, Parser, Subcommand, ValueEnum};
-use human_panic::setup_panic;
 use image::codecs::png::{CompressionType, FilterType, PngEncoder};
 use image::{ColorType, EncodableLayout, GenericImageView, ImageEncoder, Rgba};
 use itertools::Itertools;
+use rand::seq::SliceRandom;
+use rand::SeedableRng;
+
+const MAGIC: u16 = 0xd2d;
+const VERSION: u8 = 1;
+
+type Seed = String;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about)]
@@ -71,6 +77,12 @@ struct InjectArgs {
     /// Compression level used to compress PNG
     #[arg(value_enum, long, default_value_t = Compression::Default)]
     compression: Compression,
+
+    /// Use seed to place bits in pseudorandom pixel positions.
+    /// The same seed must be provided during extraction or inspection
+    /// to correctly recover the data.
+    #[arg(long)]
+    seed: Option<Seed>,
 }
 
 #[derive(Args)]
@@ -93,12 +105,22 @@ struct ExtractArgs {
     /// If none, defaults to the maximum (until the container ends)
     #[arg(long)]
     read_size: Option<u32>,
+
+    /// Seed used to pseudorandomly locate embedded data.
+    /// Must match the seed used during injection, if any.
+    #[arg(long)]
+    seed: Option<Seed>,
 }
 
 #[derive(Args)]
 struct InspectArgs {
     /// Container file
     path: PathBuf,
+
+    /// Seed used to pseudorandomly locate embedded data.
+    /// Must match the seed used during injection, if any.
+    #[arg(long)]
+    seed: Option<Seed>,
 }
 
 const KB: u32 = 1024;
@@ -136,8 +158,25 @@ fn iter_dots(w: u32, h: u32) -> impl Iterator<Item = (u32, u32)> {
     (0..w).cartesian_product(0..h)
 }
 
-const MAGIC: u16 = 0xd2d;
-const VERSION: u8 = 1;
+fn seed_to_u64(seed: &str) -> u64 {
+    let hash = blake3::hash(seed.as_bytes());
+    u64::from_le_bytes(hash.as_bytes()[..8].try_into().unwrap())
+}
+
+fn pseudo_shuffle_coords(w: u32, h: u32, seed: &Seed) -> impl Iterator<Item = (u32, u32)> {
+    let mut coords: Vec<(u32, u32)> = iter_dots(w, h).collect();
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed_to_u64(seed));
+    coords.shuffle(&mut rng);
+    coords.into_iter()
+}
+
+fn gen_dots(w: u32, h: u32, seed: Option<&Seed>) -> Box<dyn Iterator<Item = (u32, u32)>> {
+    match seed {
+        Some(seed) => Box::new(pseudo_shuffle_coords(w, h, seed)),
+        None => Box::new(iter_dots(w, h)),
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 struct Meta {
     version: u8,
@@ -280,7 +319,7 @@ fn inspect(args: InspectArgs) -> Result<(), InspectError> {
     let img = image::open(&args.path).map_err(|_| InspectError::NotAnImage)?;
     let (w, h) = img.dimensions();
     let max_cargo_size = format_size((w * h * 4) / 8);
-    let bytes = iter_dots(w, h)
+    let bytes = gen_dots(w, h, args.seed.as_ref())
         .flat_map(|(x, y)| img.get_pixel(x, y).0)
         .map(|v| v & 1)
         .chunks(8);
@@ -331,7 +370,7 @@ impl Display for ExtractError {
 fn extract(args: ExtractArgs) -> Result<(), ExtractError> {
     let img = image::open(&args.container).map_err(|_| ExtractError::ContainerOpen)?;
     let (w, h) = img.dimensions();
-    let bytes = iter_dots(w, h)
+    let bytes = gen_dots(w, h, args.seed.as_ref())
         .flat_map(|(x, y)| img.get_pixel(x, y).0)
         .map(|v| v & 1)
         .chunks(8);
@@ -423,7 +462,7 @@ fn inject(args: InjectArgs) -> Result<(), InjectError> {
             .file_name()
             .map(|v| String::from(v.to_string_lossy()));
         if let Some(v) = &filename {
-            if v.as_bytes().len() >= 255 {
+            if v.len() >= 255 {
                 return Err(InjectError::FilenameOverflow);
             }
         }
@@ -433,7 +472,7 @@ fn inject(args: InjectArgs) -> Result<(), InjectError> {
 
     let meta_size = (meta_bits.len() / 8) as u32;
     let total_size = cargo_size + meta_size; // todo: add crc32 check
-    let required_pixels = (total_size * 8) / 4;
+    let required_pixels = ((total_size * 8) / 4) as usize;
     if total_size > max_cargo_size {
         return Err(InjectError::ExceededSize {
             available: max_cargo_size,
@@ -446,8 +485,8 @@ fn inject(args: InjectArgs) -> Result<(), InjectError> {
         .bytes()
         .flat_map(|x| to_bits(x.unwrap()));
     // [(r, g, b, a), (r, g, b, a)] turns into flat [r, g, b, a, r, g, b, a]
-    let colors = iter_dots(w, h)
-        .take(required_pixels as usize)
+    let colors = gen_dots(w, h, args.seed.as_ref())
+        .take(required_pixels)
         .flat_map(|(x, y)| img.get_pixel(x, y).0)
         .collect_vec();
     let binding = meta_bits
@@ -462,7 +501,7 @@ fn inject(args: InjectArgs) -> Result<(), InjectError> {
         Rgba::from(colors)
     });
 
-    iter_dots(w, h)
+    gen_dots(w, h, args.seed.as_ref())
         .zip(new_pixels)
         .for_each(|((x, y), pixel)| img.put_pixel(x, y, pixel));
 
@@ -490,7 +529,6 @@ fn make_writer(args: &InjectArgs) -> Result<Box<dyn Write>, InjectError> {
 }
 
 fn main() -> io::Result<()> {
-    setup_panic!();
     let cli = Cli::parse();
     if let Err(e) = match cli.command {
         Commands::Inject(args) => inject(args).map_err(|e| e.to_string()),
