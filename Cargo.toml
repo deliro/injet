@@ -1,15 +1,22 @@
 [package]
 name = "injet"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Inject and extract files into PNG images using LSB (Least Significant Bit) method"
+license = "MIT"
+repository = "https://github.com/deliro/injet"
+readme = "README.md"
+categories = ["command-line-utilities", "image", "steganography"]
+keywords = ["binary", "bin", "steganography", "lsb"]
+exclude = ["/.github", "/target"]
 
 [dependencies]
-ascii_table = "4.0.2"
-clap = { version = "4.3.19", features = ["derive"] }
-human-panic = "1.1.5"
-image = "0.24.6"
-itertools = "0.11.0"
+ascii_table = "4.0"
+blake3 = "1.8"
+clap = { version = "4.3", features = ["derive"] }
+image = "0.24"
+itertools = "0.11"
+rand = "0.9"
 
 [profile.release]
 strip = true
