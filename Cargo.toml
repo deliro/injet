@@ -6,7 +6,7 @@ description = "Inject and extract files into PNG images using LSB (Least Signifi
 license = "MIT"
 repository = "https://github.com/deliro/injet"
 readme = "README.md"
-categories = ["command-line-utilities", "image", "steganography"]
+categories = ["command-line-utilities", "multimedia::images", "security"]
 keywords = ["binary", "bin", "steganography", "lsb"]
 exclude = ["/.github", "/target"]
 
