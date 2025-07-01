@@ -1,5 +1,3 @@
-use std::borrow::Cow;
-use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::io;
 use std::io::Write;
@@ -7,13 +5,13 @@ use std::io::{stdout, BufReader, BufWriter, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::process::exit;
 
-use ascii_table::AsciiTable;
 use clap::{arg, Args, Parser, Subcommand, ValueEnum};
 use image::codecs::png::{CompressionType, FilterType, PngEncoder};
 use image::{ColorType, EncodableLayout, GenericImageView, ImageEncoder, Rgba};
 use itertools::Itertools;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
+use thiserror::Error;
 
 const MAGIC: u16 = 0xd2d;
 const VERSION: u8 = 1;
@@ -270,40 +268,54 @@ where
     }
 }
 
+#[derive(Debug, Error)]
 enum MetaError {
+    #[error("Insufficient bytes to parse metadata")]
     NoBytes,
+    #[error("Invalid metadata signature")]
     SignatureMismatch,
+    #[error("Unsupported metadata version: {0}")]
     UnsupportedVersion(u8),
+    #[error("Invalid or corrupted filename in metadata")]
     MalformedFilename,
 }
 
-impl Display for MetaError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            MetaError::NoBytes => f.write_str("not enough bytes to build the meta"),
-            MetaError::SignatureMismatch => f.write_str("signature mismatch"),
-            MetaError::UnsupportedVersion(v) => {
-                f.write_str(&format!("version {} isn't supported", v))
-            }
-            MetaError::MalformedFilename => f.write_str("error reading cargo filename"),
-        }
-    }
-}
-
+#[derive(Debug, Error)]
 enum InspectError {
+    #[error("File not found")]
     FileNotExist,
+    #[error("Not a valid image file")]
     NotAnImage,
+    #[error("Not a regular file")]
     NotAFile,
 }
 
-impl Display for InspectError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            InspectError::FileNotExist => f.write_str("file doesn't exist"),
-            InspectError::NotAnImage => f.write_str("file is not an image"),
-            InspectError::NotAFile => f.write_str("not a file"),
-        }
-    }
+#[derive(Debug, Error)]
+enum ExtractError {
+    #[error("Failed to open container file")]
+    ContainerOpen,
+    #[error("Failed to save output file")]
+    Save,
+    #[error("Invalid metadata: {0}")]
+    BrokenMeta(String),
+}
+
+#[derive(Debug, Error)]
+enum InjectError {
+    #[error("Failed to open container file")]
+    CannotOpenContainer,
+    #[error("Failed to open input file")]
+    CannotOpenCargo,
+    #[error("File size exceeds container capacity: available {available}, file {cargo_size}, metadata {meta_size}")]
+    ExceededSize {
+        available: u32,
+        cargo_size: u32,
+        meta_size: u32,
+    },
+    #[error("Failed to save output file: {0}")]
+    CannotSave(String),
+    #[error("Filename is too long (maximum 255 bytes)")]
+    FilenameOverflow,
 }
 
 fn inspect(args: InspectArgs) -> Result<(), InspectError> {
@@ -330,41 +342,19 @@ fn inspect(args: InspectArgs) -> Result<(), InspectError> {
             .sum()
     });
     let meta = Meta::try_from(W(&mut content)).ok();
-    let ascii_table = AsciiTable::default();
-    let dimensions_fmt = format!("{w}x{h}");
-    let mut table_data = vec![
-        ["filename".into(), Cow::from(&filename)],
-        ["dimensions".into(), dimensions_fmt.into()],
-        ["max cargo size".into(), max_cargo_size.into()],
-    ];
-
+    println!("Image file: {filename}");
+    println!("Dimensions: {w}x{h}");
+    println!("Maximum embeddable file size: {max_cargo_size}");
     match meta {
-        None => table_data.push(["doesn't seem it contains any cargo".into(), "".into()]),
+        None => println!("No embedded data detected or metadata is missing."),
         Some(v) => {
-            let cargo_filename = v.filename.unwrap_or(String::from("<unnamed>"));
+            let cargo_filename = v.filename.unwrap_or_else(|| String::from("<unnamed>"));
             let cargo_size = format_size(v.size);
-            table_data.push(["cargo filename".into(), cargo_filename.into()]);
-            table_data.push(["cargo size".into(), cargo_size.into()]);
+            println!("Embedded file name: {cargo_filename}");
+            println!("Embedded file size: {cargo_size}");
         }
     }
-    ascii_table.print(table_data);
     Ok(())
-}
-
-enum ExtractError {
-    ContainerOpen,
-    Save,
-    BrokenMeta(String),
-}
-
-impl Display for ExtractError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ExtractError::ContainerOpen => f.write_str("cannot open the container file"),
-            ExtractError::Save => f.write_str("cannot save to the destination"),
-            ExtractError::BrokenMeta(v) => f.write_str(&format!("meta is broken: {v}")),
-        }
-    }
 }
 
 fn make_writer(dest: Option<&Path>, default: impl AsRef<Path>) -> Result<Box<dyn Write>, String> {
@@ -416,43 +406,6 @@ fn extract(args: ExtractArgs) -> Result<(), ExtractError> {
     Ok(())
 }
 
-enum InjectError {
-    CannotOpenContainer,
-    CannotOpenCargo,
-    ExceededSize {
-        available: u32,
-        cargo_size: u32,
-        meta_size: u32,
-    },
-    CannotSave(String),
-    FilenameOverflow,
-}
-
-impl Display for InjectError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            InjectError::CannotOpenContainer => f.write_str("cannot open container file"),
-            InjectError::CannotOpenCargo => f.write_str("cannot open cargo file"),
-            InjectError::ExceededSize {
-                available,
-                cargo_size,
-                meta_size,
-            } => f.write_str(&format!(
-                "cannot inject cargo. available size: {}, cargo size: {} + meta size: {}",
-                format_size(*available),
-                format_size(*cargo_size),
-                format_size(*meta_size),
-            )),
-            InjectError::CannotSave(v) => {
-                f.write_str(&format!("cannot save destination file: {v}"))
-            }
-            InjectError::FilenameOverflow => {
-                f.write_str("filename must be less than 255 bytes length")
-            }
-        }
-    }
-}
-
 fn inject(args: InjectArgs) -> Result<(), InjectError> {
     let mut img = image::open(&args.container)
         .map_err(|_| InjectError::CannotOpenContainer)?
@@ -480,8 +433,7 @@ fn inject(args: InjectArgs) -> Result<(), InjectError> {
     }
 
     let meta_size = (meta_bits.len() / 8) as u32;
-    let total_size = cargo_size + meta_size; // todo: add crc32 check
-    let required_pixels = ((total_size * 8) / 4) as usize;
+    let total_size = cargo_size + meta_size;
     if total_size > max_cargo_size {
         return Err(InjectError::ExceededSize {
             available: max_cargo_size,
@@ -493,33 +445,34 @@ fn inject(args: InjectArgs) -> Result<(), InjectError> {
     let cargo_bits = BufReader::new(cargo)
         .bytes()
         .flat_map(|x| to_bits(x.unwrap()));
-    // [(r, g, b, a), (r, g, b, a)] turns into flat [r, g, b, a, r, g, b, a]
-    let colors = gen_dots(w, h, args.seed.as_ref())
-        .take(required_pixels)
-        .flat_map(|(x, y)| img.get_pixel(x, y).0)
-        .collect_vec();
-    let binding = meta_bits
-        .into_iter()
-        .chain(cargo_bits)
-        .zip(colors)
-        .map(|(bit, color)| ((color & 0b11111110) | bit))
-        .chunks(4);
-
-    let new_pixels = binding.into_iter().map(|chunk| {
-        let colors: [u8; 4] = chunk.collect_vec().try_into().unwrap();
-        Rgba::from(colors)
-    });
-
-    gen_dots(w, h, args.seed.as_ref())
-        .zip(new_pixels)
-        .for_each(|((x, y), pixel)| img.put_pixel(x, y, pixel));
-
+    let bits = meta_bits.into_iter().chain(cargo_bits);
+    let color_coords = gen_dots(w, h, args.seed.as_ref());
+    let mut bit_iter = bits;
+    // Iterate over all coordinates, modifying only the required number of pixels
+    let mut changed = 0;
+    let total_bits = total_size * 8;
+    for (x, y) in color_coords {
+        if changed >= total_bits {
+            break;
+        }
+        let mut px = img.get_pixel(x, y).0;
+        for channel in &mut px {
+            if changed >= total_bits {
+                break;
+            }
+            if let Some(bit) = bit_iter.next() {
+                *channel = (*channel & 0b11111110) | bit;
+                changed += 1;
+            }
+        }
+        img.put_pixel(x, y, Rgba(px));
+    }
     let writer = make_writer(args.destination.as_deref(), "modified.png")
         .map_err(InjectError::CannotSave)?;
     let encoder =
         PngEncoder::new_with_quality(writer, args.compression.into(), FilterType::default());
     encoder
-        .write_image(img.as_bytes(), w, h, ColorType::Rgba8)
+        .write_image(img.as_bytes(), w, h, ColorType::Rgba8.into())
         .map_err(|e| InjectError::CannotSave(e.to_string()))
 }
 
@@ -548,7 +501,7 @@ mod tests {
         let mut bytes = meta.to_bytes().into_iter();
 
         match Meta::try_from(W(&mut bytes)) {
-            Err(_) => assert!(false, "meta wasn't read"),
+            Err(_) => panic!("meta wasn't read"),
             Ok(v) => assert_eq!(v, meta, "received meta differs"),
         }
 
