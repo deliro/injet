@@ -1,6 +1,6 @@
 [package]
 name = "injet"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2021"
 description = "Inject and extract files into PNG images using LSB (Least Significant Bit) method"
 license = "MIT"
@@ -17,6 +17,7 @@ image = "0.25"
 itertools = "0.14"
 rand = "0.9"
 thiserror = "2"
+crc32fast = "1"
 
 [profile.release]
 strip = true
