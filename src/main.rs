@@ -14,7 +14,8 @@ use rand::SeedableRng;
 use thiserror::Error;
 
 const MAGIC: u16 = 0xd2d;
-const VERSION: u8 = 1;
+const VERSION_1: u8 = 1;
+const VERSION_2: u8 = 2;
 
 type Seed = String;
 
@@ -175,101 +176,218 @@ fn gen_dots(w: u32, h: u32, seed: Option<&Seed>) -> Box<dyn Iterator<Item = (u32
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
-struct Meta {
-    version: u8,
-    size: u32,
-    filename_size: Option<u8>,
-    filename: Option<String>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetaField {
+    Size(u32),
+    Filename(String),
+    Hash(u32),
 }
 
-impl Meta {
-    fn to_bytes(&self) -> Vec<u8> {
-        // 2 bytes signature + version
-        // 4 bytes file size
-        // 1 byte filename size (if any)
-        // X bytes filename (X < 255)
-        let signature = (MAGIC << 3) | (self.version as u16);
-        let (filename_size, has_filename): (u8, _) = match &self.filename {
-            None => (0b11111111, false),
-            Some(v) => (v.len() as u8, true),
-        };
-        let mut result = Vec::with_capacity(7);
-        result.extend(signature.to_le_bytes());
-        result.extend(self.size.to_le_bytes());
-        result.push(filename_size);
-        if has_filename {
-            result.extend(self.filename.clone().unwrap().into_bytes())
+pub enum MetaFieldParseResult {
+    Field(MetaField),
+    End,
+    Skip,
+}
+
+impl MetaField {
+    fn tag(&self) -> MetaTag {
+        match self {
+            MetaField::Size(_) => MetaTag::Size,
+            MetaField::Filename(_) => MetaTag::Filename,
+            MetaField::Hash(_) => MetaTag::Hash,
         }
+    }
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut result = vec![u8::from(self.tag())];
+        let value = match self {
+            MetaField::Size(sz) => sz.to_le_bytes().to_vec(),
+            MetaField::Filename(s) => s.as_bytes().to_vec(),
+            MetaField::Hash(h) => h.to_le_bytes().to_vec(),
+        };
+        if value.len() > 255 {
+            result.push(0x00);
+            result.extend((value.len() as u16).to_le_bytes());
+        } else {
+            result.push(value.len() as u8);
+        }
+        result.extend(value);
         result
     }
-
-    fn to_bits(&self) -> impl Iterator<Item = u8> {
-        self.to_bytes().into_iter().flat_map(to_bits)
-    }
-
-    fn make(size: u32, filename: Option<String>) -> Self {
-        let filename_size = filename.as_ref().map(|v| v.len() as u8);
-        Self {
-            version: VERSION,
-            size,
-            filename_size,
-            filename,
+    pub fn from_tlv_field<T: Iterator<Item = u8>>(
+        iter: &mut T,
+    ) -> Result<MetaFieldParseResult, MetaError> {
+        let tag_byte = iter.next().ok_or(MetaError::NoBytes)?;
+        let len = iter.next().ok_or(MetaError::NoBytes)?;
+        if tag_byte == 0 && len == 0 {
+            return Ok(MetaFieldParseResult::End);
         }
-    }
-}
-
-// https://github.com/Ixrec/rust-orphan-rules
-struct W<T>(T);
-impl<T> TryFrom<W<&mut T>> for Meta
-where
-    T: Iterator<Item = u8>,
-{
-    type Error = MetaError;
-
-    fn try_from(W(value): W<&mut T>) -> Result<Self, Self::Error> {
-        let header = value.take(7).collect_vec();
-        if header.len() != 7 {
+        let tag = match MetaTag::try_from(tag_byte) {
+            Ok(t) => t,
+            Err(_) => return Ok(MetaFieldParseResult::Skip),
+        };
+        let actual_len = if len == 0x00 {
+            let l = [
+                iter.next().ok_or(MetaError::NoBytes)?,
+                iter.next().ok_or(MetaError::NoBytes)?,
+            ];
+            u16::from_le_bytes(l) as usize
+        } else {
+            len as usize
+        };
+        let bytes: Vec<u8> = iter.take(actual_len).collect();
+        if bytes.len() != actual_len {
             return Err(MetaError::NoBytes);
         }
-        let signature = u16::from_le_bytes(header[0..2].try_into().unwrap());
-        let sign = signature >> 3;
-        if sign != MAGIC {
-            return Err(MetaError::SignatureMismatch);
+        let field = match tag {
+            MetaTag::Size if bytes.len() == 4 => Some(MetaField::Size(u32::from_le_bytes(
+                bytes.try_into().unwrap(),
+            ))),
+            MetaTag::Filename => Some(MetaField::Filename(
+                String::from_utf8_lossy(&bytes).to_string(),
+            )),
+            MetaTag::Hash if bytes.len() == 4 => Some(MetaField::Hash(u32::from_le_bytes(
+                bytes.try_into().unwrap(),
+            ))),
+            _ => None,
+        };
+        Ok(match field {
+            Some(f) => MetaFieldParseResult::Field(f),
+            None => MetaFieldParseResult::Skip,
+        })
+    }
+    pub fn as_size(&self) -> Option<u32> {
+        if let MetaField::Size(sz) = self {
+            Some(*sz)
+        } else {
+            None
         }
-
-        let version = (signature & 0b111) as u8;
-        if version != VERSION {
-            return Err(MetaError::UnsupportedVersion(version));
+    }
+    pub fn as_filename(&self) -> Option<&str> {
+        if let MetaField::Filename(s) = self {
+            Some(s)
+        } else {
+            None
         }
-
-        let size = u32::from_le_bytes(header[2..6].try_into().unwrap());
-        let filename_size = match header[6] {
-            0b11111111 => None,
+    }
+    pub fn as_hash(&self) -> Option<u32> {
+        if let MetaField::Hash(h) = self {
+            Some(*h)
+        } else {
+            None
+        }
+    }
+    pub fn from_v1_header<T: Iterator<Item = u8>>(
+        iter: &mut T,
+    ) -> Result<Vec<MetaField>, MetaError> {
+        let header_rest: Vec<u8> = iter.take(5).collect();
+        if header_rest.len() != 5 {
+            return Err(MetaError::NoBytes);
+        }
+        let size = u32::from_le_bytes(header_rest[0..4].try_into().unwrap());
+        let filename_size = match header_rest[4] {
+            0xFF => None,
             sz => Some(sz),
         };
-
-        let mut filename = None;
+        let mut fields = vec![MetaField::Size(size)];
         if let Some(sz) = filename_size {
-            let filename_vec = value.take(sz as usize).collect_vec();
+            let filename_vec = iter.take(sz as usize).collect::<Vec<u8>>();
             if filename_vec.len() as u8 != sz {
                 return Err(MetaError::MalformedFilename);
             }
             let filename_lossy = String::from_utf8_lossy(&filename_vec);
-            filename = Some(filename_lossy.to_string());
+            fields.push(MetaField::Filename(filename_lossy.to_string()));
         }
+        Ok(fields)
+    }
+}
 
-        Ok(Self {
-            version,
-            size,
-            filename_size,
-            filename,
-        })
+#[derive(Debug, Eq, PartialEq)]
+pub struct Meta {
+    pub version: u8,
+    pub fields: Vec<MetaField>,
+}
+
+impl Meta {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let signature = (MAGIC << 3) | (VERSION_2 as u16);
+        let mut result = Vec::with_capacity(32);
+        result.extend(signature.to_le_bytes());
+        for field in &self.fields {
+            result.extend(field.to_bytes());
+        }
+        result.push(0);
+        result.push(0);
+        result
+    }
+
+    pub fn to_bits(&self) -> impl Iterator<Item = u8> {
+        self.to_bytes().into_iter().flat_map(to_bits)
+    }
+
+    pub fn make(size: Option<u32>, filename: Option<String>, hash: Option<u32>) -> Self {
+        let mut fields = Vec::new();
+        if let Some(size) = size {
+            fields.push(MetaField::Size(size));
+        }
+        if let Some(filename) = filename {
+            fields.push(MetaField::Filename(filename));
+        }
+        if let Some(hash) = hash {
+            fields.push(MetaField::Hash(hash));
+        }
+        Self {
+            version: VERSION_2,
+            fields,
+        }
+    }
+
+    pub fn read<T>(value: &mut T) -> Result<Self, MetaError>
+    where
+        T: Iterator<Item = u8>,
+    {
+        let sig_bytes: Vec<u8> = value.take(2).collect();
+        if sig_bytes.len() != 2 {
+            return Err(MetaError::NoBytes);
+        }
+        let signature = u16::from_le_bytes([sig_bytes[0], sig_bytes[1]]);
+        let sign = signature >> 3;
+        if sign != MAGIC {
+            return Err(MetaError::SignatureMismatch);
+        }
+        let version = (signature & 0b111) as u8;
+        match version {
+            VERSION_1 => {
+                let fields = MetaField::from_v1_header(value)?;
+                Ok(Meta { version, fields })
+            }
+            VERSION_2 => {
+                let mut fields = Vec::new();
+                loop {
+                    match MetaField::from_tlv_field(value)? {
+                        MetaFieldParseResult::Field(field) => fields.push(field),
+                        MetaFieldParseResult::End => break,
+                        MetaFieldParseResult::Skip => continue,
+                    }
+                }
+                Ok(Meta { version, fields })
+            }
+            v => Err(MetaError::UnsupportedVersion(v)),
+        }
+    }
+
+    pub fn size(&self) -> Option<u32> {
+        self.fields.iter().find_map(|f| f.as_size())
+    }
+    pub fn filename(&self) -> Option<&str> {
+        self.fields.iter().find_map(|f| f.as_filename())
+    }
+    pub fn hash(&self) -> Option<u32> {
+        self.fields.iter().find_map(|f| f.as_hash())
     }
 }
 
 #[derive(Debug, Error)]
-enum MetaError {
+pub enum MetaError {
     #[error("Insufficient bytes to parse metadata")]
     NoBytes,
     #[error("Invalid metadata signature")]
@@ -298,6 +416,8 @@ enum ExtractError {
     Save,
     #[error("Invalid metadata: {0}")]
     BrokenMeta(String),
+    #[error("Failed to verify hash")]
+    HashMismatch,
 }
 
 #[derive(Debug, Error)]
@@ -316,6 +436,36 @@ enum InjectError {
     CannotSave(String),
     #[error("Filename is too long (maximum 255 bytes)")]
     FilenameOverflow,
+}
+
+macro_rules! meta_tag_enum {
+    ($( $name:ident = $val:expr ),* $(,)?) => {
+        #[repr(u8)]
+        #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+        enum MetaTag {
+            $( $name = $val, )*
+        }
+        impl From<MetaTag> for u8 {
+            fn from(tag: MetaTag) -> Self {
+                tag as u8
+            }
+        }
+        impl std::convert::TryFrom<u8> for MetaTag {
+            type Error = ();
+            fn try_from(value: u8) -> Result<Self, Self::Error> {
+                match value {
+                    $( $val => Ok(MetaTag::$name), )*
+                    _ => Err(()),
+                }
+            }
+        }
+    };
+}
+
+meta_tag_enum! {
+    Size = 1,
+    Filename = 2,
+    Hash = 3,
 }
 
 fn inspect(args: InspectArgs) -> Result<(), InspectError> {
@@ -341,17 +491,24 @@ fn inspect(args: InspectArgs) -> Result<(), InspectError> {
             .map(|(bit, shift)| bit << shift)
             .sum()
     });
-    let meta = Meta::try_from(W(&mut content)).ok();
+    let meta = Meta::read(&mut content).ok();
     println!("Image file: {filename}");
     println!("Dimensions: {w}x{h}");
     println!("Maximum embeddable file size: {max_cargo_size}");
     match meta {
         None => println!("No embedded data detected or metadata is missing."),
-        Some(v) => {
-            let cargo_filename = v.filename.unwrap_or_else(|| String::from("<unnamed>"));
-            let cargo_size = format_size(v.size);
+        Some(ref v) => {
+            println!("Metadata version: {}", v.version);
+            let cargo_filename = v.filename().unwrap_or("<unnamed>");
+            let cargo_size = v
+                .size()
+                .map(format_size)
+                .unwrap_or_else(|| "<unknown>".to_string());
             println!("Embedded file name: {cargo_filename}");
             println!("Embedded file size: {cargo_size}");
+            if let Some(hash) = v.hash() {
+                println!("Embedded file CRC32: {hash:08x}");
+            }
         }
     }
     Ok(())
@@ -382,13 +539,13 @@ fn extract(args: ExtractArgs) -> Result<(), ExtractError> {
             .sum()
     });
     let meta = if args.read_meta {
-        Some(Meta::try_from(W(&mut content)).map_err(|e| ExtractError::BrokenMeta(e.to_string()))?)
+        Some(Meta::read(&mut content).map_err(|e| ExtractError::BrokenMeta(e.to_string()))?)
     } else {
         None
     };
 
-    let (meta_filename, size) = if let Some(Meta { filename, size, .. }) = meta {
-        (filename.map(PathBuf::from), Some(size))
+    let (meta_filename, size) = if let Some(meta) = &meta {
+        (meta.filename().map(PathBuf::from), meta.size())
     } else {
         (None, None)
     };
@@ -399,10 +556,39 @@ fn extract(args: ExtractArgs) -> Result<(), ExtractError> {
         meta_filename.unwrap_or(PathBuf::from("cargo")),
     )
     .map_err(|_| ExtractError::Save)?;
-    for b in content.take(read_size as usize) {
-        writer.write_all(&[b]).map_err(|_| ExtractError::Save)?
+    let mut crc = crc32fast::Hasher::new();
+    let mut buffer = [0u8; 8192];
+    let mut remaining = read_size as usize;
+    while remaining > 0 {
+        let to_read = buffer.len().min(remaining);
+        let mut filled = 0;
+        while filled < to_read {
+            match content.next() {
+                Some(b) => {
+                    buffer[filled] = b;
+                    filled += 1;
+                }
+                None => break,
+            }
+        }
+        if filled == 0 {
+            break;
+        }
+        writer
+            .write_all(&buffer[..filled])
+            .map_err(|_| ExtractError::Save)?;
+        crc.update(&buffer[..filled]);
+        remaining -= filled;
     }
     writer.flush().map_err(|_| ExtractError::Save)?;
+    if let Some(meta) = &meta {
+        if let Some(expected_hash) = meta.hash() {
+            let calculated_hash = crc.finalize();
+            if calculated_hash != expected_hash {
+                return Err(ExtractError::HashMismatch);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -428,7 +614,20 @@ fn inject(args: InjectArgs) -> Result<(), InjectError> {
                 return Err(InjectError::FilenameOverflow);
             }
         }
-        let meta = Meta::make(cargo_size, filename);
+        // Calculate crc32 on a separate file descriptor
+        let mut hasher = crc32fast::Hasher::new();
+        let mut crc_file = File::open(&args.cargo).map_err(|_| InjectError::CannotOpenCargo)?;
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = std::io::Read::read(&mut crc_file, &mut buf)
+                .map_err(|_| InjectError::CannotOpenCargo)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        let hash = hasher.finalize();
+        let meta = Meta::make(Some(cargo_size), filename, Some(hash));
         meta_bits.extend(meta.to_bits());
     }
 
@@ -493,18 +692,43 @@ fn main() -> io::Result<()> {
 mod tests {
     use std::assert_eq;
 
-    use crate::{Meta, W};
+    use super::{MAGIC, VERSION_1};
+    use crate::Meta;
 
     #[test]
-    fn meta_test() {
-        let meta = Meta::make(1231234, Some("hello.zip".to_string()));
-        let mut bytes = meta.to_bytes().into_iter();
-
-        match Meta::try_from(W(&mut bytes)) {
-            Err(_) => panic!("meta wasn't read"),
-            Ok(v) => assert_eq!(v, meta, "received meta differs"),
+    fn test_meta_v2_roundtrip() {
+        let meta = Meta::make(Some(1231234), Some("hello.zip".to_string()), Some(u32::MAX));
+        let meta_bytes = meta.to_bytes();
+        println!("meta v2 bytes: {:02x?}", meta_bytes);
+        let mut bytes = meta_bytes.into_iter();
+        match Meta::read(&mut bytes) {
+            Err(_) => panic!("meta wasn't read (v2)"),
+            Ok(v) => assert_eq!(v, meta, "received meta differs (v2)"),
         }
-
         assert_eq!(bytes.next(), None);
+    }
+
+    #[test]
+    fn test_meta_v1_parsing() {
+        // Test version 1 (legacy): manual bytes, only parse
+        let mut v1_bytes = Vec::new();
+        let signature = (MAGIC << 3) | (VERSION_1 as u16);
+        v1_bytes.extend(signature.to_le_bytes());
+        v1_bytes.extend(1231234u32.to_le_bytes());
+        let filename = b"hello.zip";
+        v1_bytes.push(filename.len() as u8);
+        v1_bytes.extend(filename);
+        let mut v1_iter = v1_bytes.into_iter();
+        let meta_v1 = Meta::read(&mut v1_iter).expect("meta v1 should parse");
+        assert_eq!(meta_v1.version, VERSION_1);
+        assert_eq!(
+            meta_v1.fields.iter().find_map(|f| f.as_size()).unwrap(),
+            1231234
+        );
+        assert_eq!(
+            meta_v1.fields.iter().find_map(|f| f.as_filename()).unwrap(),
+            "hello.zip"
+        );
+        assert_eq!(v1_iter.next(), None);
     }
 }

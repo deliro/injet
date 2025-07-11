@@ -703,11 +703,12 @@ dependencies = [
 
 [[package]]
 name = "injet"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "assert_cmd",
  "blake3",
  "clap",
+ "crc32fast",
  "image",
  "itertools 0.14.0",
  "predicates",
