@@ -24,7 +24,6 @@ fn setup_env() -> TestEnv {
     let bin_path = dir.path().join("payload.bin");
     let out_png_path = dir.path().join("out.png");
     let extracted_bin_path = dir.path().join("extracted.bin");
-    // Always create fresh PNG and test file
     let img: ImageBuffer<Rgba<u8>, Vec<u8>> =
         ImageBuffer::from_fn(100, 100, |_x, _y| Rgba([255, 255, 255, 255]));
     img.save(&png_path).unwrap();
@@ -61,32 +60,6 @@ fn assert_extract_fails_with_error(png_path: &Path, extracted_path: &Path, expec
     cmd.assert()
         .failure()
         .stderr(predicate::str::contains(expected));
-}
-
-#[test]
-fn extract_fails_on_corrupted_metadata() {
-    let env = setup_env();
-    inject_file_into_png(&env.bin_path, &env.png_path, &env.out_png_path, true, None);
-    let corrupted_png_path = env.dir.path().join("corrupted.png");
-    corrupt_metadata_bit(&env.out_png_path, &corrupted_png_path);
-    assert_extract_fails_with_error(
-        &corrupted_png_path,
-        &env.extracted_bin_path,
-        "Invalid metadata signature",
-    );
-}
-
-#[test]
-fn extract_fails_on_crc32_data() {
-    let env = setup_env();
-    inject_file_into_png(&env.bin_path, &env.png_path, &env.out_png_path, true, None);
-    let corrupted_png_path = env.dir.path().join("corrupted_data.png");
-    corrupt_payload_bit(&env.out_png_path, &corrupted_png_path);
-    assert_extract_fails_with_error(
-        &corrupted_png_path,
-        &env.extracted_bin_path,
-        "Failed to verify hash",
-    );
 }
 
 fn inject_file_into_png(
@@ -147,6 +120,45 @@ fn extract_file_from_png(
             .stderr(predicate::str::contains("Invalid metadata"));
         None
     }
+}
+
+/// Checks that inject fails if the payload is too large for the PNG.
+///
+/// # Parameters
+/// - `payload_size = 6000`: Payload is larger than the PNG can hold (100x100 RGBA8 PNG can hold
+///   5000 bytes max, so 6000 is always too much).
+/// - `payload_size = 5000`: Payload fits exactly into the PNG if there is no meta, but with meta it
+///   does not fit. This checks the edge case when meta pushes the total size over the limit.
+#[rstest]
+#[case(6000)]
+#[case(5000)]
+fn inject_fails_on_size_limits(#[case] payload_size: usize) {
+    let env = setup_env();
+    let payload = vec![0u8; payload_size];
+    let bin_path = env.dir.path().join("payload_param.bin");
+    std::fs::write(&bin_path, &payload).unwrap();
+    let mut cmd = Command::cargo_bin("injet").unwrap();
+    cmd.args([
+        "inject",
+        bin_path.to_str().unwrap(),
+        env.png_path.to_str().unwrap(),
+        "-d",
+        env.out_png_path.to_str().unwrap(),
+    ]);
+    cmd.assert()
+        .failure()
+        .stderr(predicate::str::contains("exceeds container capacity"));
+}
+
+#[rstest]
+#[case(corrupt_metadata_bit as fn(&Path, &Path), "Invalid metadata signature")]
+#[case(corrupt_payload_bit as fn(&Path, &Path), "Failed to verify hash")]
+fn extract_fails_on_corruption(#[case] corrupt_fn: fn(&Path, &Path), #[case] expected_error: &str) {
+    let env = setup_env();
+    inject_file_into_png(&env.bin_path, &env.png_path, &env.out_png_path, true, None);
+    let corrupted_png_path = env.dir.path().join("corrupted_param.png");
+    corrupt_fn(&env.out_png_path, &corrupted_png_path);
+    assert_extract_fails_with_error(&corrupted_png_path, &env.extracted_bin_path, expected_error);
 }
 
 #[rstest]
