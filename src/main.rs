@@ -165,14 +165,13 @@ fn iter_dots(w: u32, h: u32) -> impl Iterator<Item = (u32, u32)> {
     (0..w).cartesian_product(0..h)
 }
 
-fn seed_to_u64(seed: &str) -> u64 {
-    let hash = blake3::hash(seed.as_bytes());
-    u64::from_le_bytes(hash.as_bytes()[..8].try_into().unwrap())
+fn seed_to_array(seed: &str) -> [u8; 32] {
+    *blake3::hash(seed.as_bytes()).as_bytes()
 }
 
 fn pseudo_shuffle_coords(w: u32, h: u32, seed: &Seed) -> impl Iterator<Item = (u32, u32)> {
     let mut coords: Vec<(u32, u32)> = iter_dots(w, h).collect();
-    let mut rng = rand::rngs::StdRng::seed_from_u64(seed_to_u64(seed));
+    let mut rng = rand::rngs::StdRng::from_seed(seed_to_array(seed));
     coords.shuffle(&mut rng);
     coords.into_iter()
 }
