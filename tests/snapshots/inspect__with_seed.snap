@@ -1,0 +1,11 @@
+---
+source: tests/inspect.rs
+expression: stdout
+---
+Dimensions: 80x80
+Maximum embeddable file size: 3.12 KB
+Metadata version: 3
+Embedded file name: hi.bin
+Embedded file size: 11 bytes
+Embedded file CRC32: 0d4a1185
+Header CRC32: 712a13ef
