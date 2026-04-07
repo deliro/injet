@@ -213,6 +213,18 @@ impl MetaField {
         result.extend(value);
         result
     }
+    fn read_tlv_len<T: Iterator<Item = u8>>(
+        iter: &mut T,
+        first_len_byte: u8,
+    ) -> Result<usize, MetaError> {
+        if first_len_byte != 0 {
+            return Ok(first_len_byte as usize);
+        }
+        let hi = iter.next().ok_or(MetaError::NoBytes)?;
+        let lo = iter.next().ok_or(MetaError::NoBytes)?;
+        Ok(u16::from_le_bytes([hi, lo]) as usize)
+    }
+
     pub fn from_tlv_field<T: Iterator<Item = u8>>(
         iter: &mut T,
     ) -> Result<MetaFieldParseResult, MetaError> {
@@ -221,32 +233,24 @@ impl MetaField {
         if tag_byte == 0 && len == 0 {
             return Ok(MetaFieldParseResult::End);
         }
-        let tag = match MetaTag::try_from(tag_byte) {
-            Ok(t) => t,
-            Err(_) => return Ok(MetaFieldParseResult::Skip),
-        };
-        let actual_len = if len == 0x00 {
-            let l = [
-                iter.next().ok_or(MetaError::NoBytes)?,
-                iter.next().ok_or(MetaError::NoBytes)?,
-            ];
-            u16::from_le_bytes(l) as usize
-        } else {
-            len as usize
-        };
+        let actual_len = Self::read_tlv_len(iter, len)?;
         let bytes: Vec<u8> = iter.take(actual_len).collect();
         if bytes.len() != actual_len {
             return Err(MetaError::NoBytes);
         }
+        let tag = match MetaTag::try_from(tag_byte) {
+            Ok(t) => t,
+            Err(_) => return Ok(MetaFieldParseResult::Skip),
+        };
         let field = match tag {
             MetaTag::Size if bytes.len() == 4 => Some(MetaField::Size(u32::from_le_bytes(
-                bytes.try_into().unwrap(),
+                bytes.try_into().expect("checked length == 4"),
             ))),
             MetaTag::Filename => Some(MetaField::Filename(
                 String::from_utf8_lossy(&bytes).to_string(),
             )),
             MetaTag::Hash if bytes.len() == 4 => Some(MetaField::Hash(u32::from_le_bytes(
-                bytes.try_into().unwrap(),
+                bytes.try_into().expect("checked length == 4"),
             ))),
             _ => None,
         };
@@ -730,5 +734,44 @@ mod tests {
             "hello.zip"
         );
         assert_eq!(v1_iter.next(), None);
+    }
+
+    #[test]
+    fn test_meta_v2_skips_unknown_tlv_and_keeps_parsing() {
+        use crate::{MAGIC, VERSION_2};
+        // Build a v2 meta byte stream:
+        //   signature(v2) | Size(4) | UnknownTag=0x7F len=5 + 5 bytes | Filename "x.zip" | end
+        let mut bytes = Vec::new();
+        let signature = (MAGIC << 3) | (VERSION_2 as u16);
+        bytes.extend(signature.to_le_bytes());
+
+        // Size = 1234
+        bytes.push(1); // tag Size
+        bytes.push(4); // len
+        bytes.extend(1234u32.to_le_bytes());
+
+        // Unknown tag 0x7F with 5-byte payload
+        bytes.push(0x7F);
+        bytes.push(5);
+        bytes.extend([0xAA, 0xBB, 0xCC, 0xDD, 0xEE]);
+
+        // Filename "x.zip"
+        bytes.push(2); // tag Filename
+        bytes.push(5); // len
+        bytes.extend(b"x.zip");
+
+        // end marker
+        bytes.push(0);
+        bytes.push(0);
+
+        let mut iter = bytes.into_iter();
+        let meta = Meta::read(&mut iter).expect("meta should parse despite unknown tag");
+        assert_eq!(meta.size(), Some(1234), "Size field must survive unknown tag");
+        assert_eq!(
+            meta.filename(),
+            Some("x.zip"),
+            "Filename after unknown tag must still be parsed"
+        );
+        assert_eq!(iter.next(), None, "stream must be fully consumed");
     }
 }
