@@ -988,4 +988,19 @@ mod tests {
         let s = display_path(Path::new("/tmp/hello.bin"));
         assert_eq!(s, "hello.bin");
     }
+
+    #[test]
+    fn test_pseudo_shuffle_is_deterministic_for_same_seed() {
+        use crate::pseudo_shuffle_coords;
+        let a: Vec<_> = pseudo_shuffle_coords(20, 20, &"abc".to_string()).collect();
+        let b: Vec<_> = pseudo_shuffle_coords(20, 20, &"abc".to_string()).collect();
+        assert_eq!(a, b, "same seed must yield identical order");
+        let c: Vec<_> = pseudo_shuffle_coords(20, 20, &"abd".to_string()).collect();
+        assert_ne!(a, c, "different seed must yield different order");
+        // Permutation property: every coordinate appears exactly once.
+        let mut sorted = a.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 400);
+    }
 }
