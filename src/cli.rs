@@ -45,7 +45,7 @@ impl From<Compression> for CompressionType {
 #[derive(Args)]
 pub struct InjectArgs {
     /// The file to inject
-    pub cargo: PathBuf,
+    pub payload: PathBuf,
 
     /// The image (container)
     pub container: PathBuf,
@@ -76,7 +76,7 @@ pub struct ExtractArgs {
     pub container: PathBuf,
 
     /// Where to save the extracted file. If not set, the filename will be read
-    /// from metadata (if any). If none are set, defaults to "cargo"
+    /// from metadata (if any). If none are set, defaults to "payload"
     #[arg(short, long)]
     pub destination: Option<PathBuf>,
 
@@ -86,7 +86,7 @@ pub struct ExtractArgs {
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub read_meta: bool,
 
-    /// How many bytes of the cargo file to read. Defaults to the value in metadata.
+    /// How many bytes of the payload file to read. Defaults to the value in metadata.
     /// If none, defaults to the maximum (until the container ends)
     #[arg(long)]
     pub read_size: Option<u32>,

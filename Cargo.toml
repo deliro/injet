@@ -1,6 +1,6 @@
 [package]
 name = "injet"
-version = "0.3.0"
+version = "1.0.0"
 edition = "2021"
 description = "Inject and extract files into PNG images using LSB (Least Significant Bit) method"
 license = "MIT"
@@ -19,6 +19,12 @@ rand = "0.9"
 thiserror = "2"
 crc32fast = "1"
 
+# mimalloc upstream supports glibc Linux, macOS, Windows, and FreeBSD on the
+# tier-1 architectures we ship for. Excluded on musl and unknown targets where
+# the C bindings either fail to build or regress vs. the system allocator.
+[target.'cfg(any(all(target_os = "linux", not(target_env = "musl")), target_os = "macos", target_os = "windows", target_os = "freebsd"))'.dependencies]
+mimalloc = { version = "0.1", default-features = false }
+
 [profile.release]
 strip = true
 
@@ -28,3 +34,32 @@ assert_cmd = "2"
 rstest = "0.18"
 predicates = "3"
 insta = "1"
+
+[lints.rust]
+warnings = "deny"
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+indexing_slicing = "deny"
+string_slice = "deny"
+arithmetic_side_effects = "deny"
+cast_possible_truncation = "deny"
+cast_sign_loss = "deny"
+cast_possible_wrap = "deny"
+cast_precision_loss = "deny"
+float_cmp = "deny"
+lossy_float_literal = "deny"
+as_conversions = "deny"
+default_numeric_fallback = "deny"
+mod_module_files = "allow"
+module_name_repetitions = "allow"
+multiple_crate_versions = "allow"
+cargo_common_metadata = "allow"
+similar_names = "allow"

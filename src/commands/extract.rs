@@ -10,6 +10,8 @@ use crate::cli::ExtractArgs;
 use crate::lsb::gen_dots;
 use crate::meta::Meta;
 
+const READ_BUFFER_SIZE: usize = 8192;
+
 #[derive(Debug, Error)]
 pub enum ExtractError {
     #[error("Failed to open container file")]
@@ -77,11 +79,10 @@ fn make_extract_target(
     default: impl AsRef<Path>,
 ) -> Result<ExtractTarget, String> {
     if !stdout().is_terminal() && dest.is_none() {
-        return Ok(ExtractTarget::Stdout(Box::new(stdout()) as Box<dyn Write>));
+        let writer: Box<dyn Write> = Box::new(stdout());
+        return Ok(ExtractTarget::Stdout(writer));
     }
-    let final_path = dest
-        .map(PathBuf::from)
-        .unwrap_or_else(|| default.as_ref().to_path_buf());
+    let final_path = dest.map_or_else(|| default.as_ref().to_path_buf(), PathBuf::from);
     // Append ".partial" to the final path (preserving any existing extension).
     let partial_path = {
         let mut p = final_path.as_os_str().to_owned();
@@ -97,18 +98,38 @@ fn make_extract_target(
     })
 }
 
-pub fn extract(args: ExtractArgs) -> Result<(), ExtractError> {
+fn fill_buffer<I: Iterator<Item = u8>>(content: &mut I, buffer: &mut [u8]) -> usize {
+    let mut filled: usize = 0;
+    for slot in buffer.iter_mut() {
+        match content.next() {
+            Some(b) => {
+                *slot = b;
+                filled = filled.saturating_add(1);
+            }
+            None => break,
+        }
+    }
+    filled
+}
+
+/// Extracts a previously injected file from a PNG container.
+///
+/// # Errors
+///
+/// Returns an [`ExtractError`] for unreadable containers, malformed metadata,
+/// hash mismatches, or filesystem errors while writing the output.
+pub fn extract(args: &ExtractArgs) -> Result<(), ExtractError> {
     let img = image::open(&args.container).map_err(|_| ExtractError::ContainerOpen)?;
-    let (w, h) = img.dimensions();
-    let bytes = gen_dots(w, h, args.seed.as_ref())
+    let (width, height) = img.dimensions();
+    let bytes = gen_dots(width, height, args.seed.as_ref())
         .flat_map(|(x, y)| img.get_pixel(x, y).0)
         .map(|v| v & 1)
         .chunks(8);
     let mut content = bytes.into_iter().map(|chunk| {
         chunk
-            .zip((0..8).rev())
+            .zip((0_u8..8).rev())
             .map(|(bit, shift)| bit << shift)
-            .sum()
+            .sum::<u8>()
     });
     let meta = if args.read_meta {
         Some(Meta::read(&mut content).map_err(|e| ExtractError::BrokenMeta(e.to_string()))?)
@@ -125,35 +146,26 @@ pub fn extract(args: ExtractArgs) -> Result<(), ExtractError> {
     let read_size = args.read_size.or(size).unwrap_or(u32::MAX);
     let mut target = make_extract_target(
         args.destination.as_deref(),
-        meta_filename.unwrap_or(PathBuf::from("cargo")),
+        meta_filename.unwrap_or_else(|| PathBuf::from("payload")),
     )
     .map_err(|_| ExtractError::Save)?;
 
     let result = (|| -> Result<(), ExtractError> {
         let mut crc = crc32fast::Hasher::new();
-        let mut buffer = [0u8; 8192];
-        let mut remaining = read_size as usize;
+        let mut buffer = [0_u8; READ_BUFFER_SIZE];
+        let mut remaining = usize::try_from(read_size).unwrap_or(usize::MAX);
         let writer = target.writer_mut();
         while remaining > 0 {
             let to_read = buffer.len().min(remaining);
-            let mut filled = 0;
-            while filled < to_read {
-                match content.next() {
-                    Some(b) => {
-                        buffer[filled] = b;
-                        filled += 1;
-                    }
-                    None => break,
-                }
-            }
+            let target_slice = buffer.get_mut(..to_read).ok_or(ExtractError::Save)?;
+            let filled = fill_buffer(&mut content, target_slice);
             if filled == 0 {
                 break;
             }
-            writer
-                .write_all(&buffer[..filled])
-                .map_err(|_| ExtractError::Save)?;
-            crc.update(&buffer[..filled]);
-            remaining -= filled;
+            let written = buffer.get(..filled).ok_or(ExtractError::Save)?;
+            writer.write_all(written).map_err(|_| ExtractError::Save)?;
+            crc.update(written);
+            remaining = remaining.saturating_sub(filled);
         }
         writer.flush().map_err(|_| ExtractError::Save)?;
         if let Some(meta) = &meta {
