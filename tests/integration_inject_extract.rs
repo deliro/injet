@@ -210,6 +210,19 @@ fn extract_with_wrong_or_missing_seed_fails(#[case] use_wrong_seed: bool) {
 }
 
 #[test]
+fn inject_emits_v3_header_with_meta_hash() {
+    let env = setup_env();
+    inject_file_into_png(&env.bin_path, &env.png_path, &env.out_png_path, true, None);
+
+    // Inspect must report version 3.
+    let mut cmd = Command::cargo_bin("injet").unwrap();
+    cmd.args(["inspect", env.out_png_path.to_str().unwrap()]);
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("Metadata version: 3"));
+}
+
+#[test]
 fn inject_accepts_filename_of_exactly_255_bytes() {
     let env = setup_env();
     // 255 ASCII bytes total, including ".bin"
