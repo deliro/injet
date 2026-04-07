@@ -16,6 +16,7 @@ use thiserror::Error;
 const MAGIC: u16 = 0xd2d;
 const VERSION_1: u8 = 1;
 const VERSION_2: u8 = 2;
+const VERSION_3: u8 = 3;
 
 type Seed = String;
 
@@ -188,6 +189,7 @@ pub enum MetaField {
     Size(u32),
     Filename(String),
     Hash(u32),
+    MetaHash(u32),
 }
 
 pub enum MetaFieldParseResult {
@@ -202,6 +204,7 @@ impl MetaField {
             MetaField::Size(_) => MetaTag::Size,
             MetaField::Filename(_) => MetaTag::Filename,
             MetaField::Hash(_) => MetaTag::Hash,
+            MetaField::MetaHash(_) => MetaTag::MetaHash,
         }
     }
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -210,6 +213,7 @@ impl MetaField {
             MetaField::Size(sz) => sz.to_le_bytes().to_vec(),
             MetaField::Filename(s) => s.as_bytes().to_vec(),
             MetaField::Hash(h) => h.to_le_bytes().to_vec(),
+            MetaField::MetaHash(h) => h.to_le_bytes().to_vec(),
         };
         if value.len() > 255 {
             result.push(0x00);
@@ -259,6 +263,9 @@ impl MetaField {
             MetaTag::Hash if bytes.len() == 4 => Some(MetaField::Hash(u32::from_le_bytes(
                 bytes.try_into().expect("checked length == 4"),
             ))),
+            MetaTag::MetaHash if bytes.len() == 4 => Some(MetaField::MetaHash(
+                u32::from_le_bytes(bytes.try_into().expect("checked length == 4")),
+            )),
             _ => None,
         };
         Ok(match field {
@@ -282,6 +289,13 @@ impl MetaField {
     }
     pub fn as_hash(&self) -> Option<u32> {
         if let MetaField::Hash(h) = self {
+            Some(*h)
+        } else {
+            None
+        }
+    }
+    pub fn as_meta_hash(&self) -> Option<u32> {
+        if let MetaField::MetaHash(h) = self {
             Some(*h)
         } else {
             None
@@ -319,12 +333,28 @@ pub struct Meta {
 }
 
 impl Meta {
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let signature = (MAGIC << 3) | (VERSION_2 as u16);
-        let mut result = Vec::with_capacity(32);
-        result.extend(signature.to_le_bytes());
+    fn write_fields(&self, buf: &mut Vec<u8>, skip_meta_hash: bool) {
         for field in &self.fields {
-            result.extend(field.to_bytes());
+            if skip_meta_hash && field.as_meta_hash().is_some() {
+                continue;
+            }
+            buf.extend(field.to_bytes());
+        }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let signature = match self.version {
+            VERSION_3 => (MAGIC << 3) | (VERSION_3 as u16),
+            _ => (MAGIC << 3) | (VERSION_2 as u16),
+        };
+        let mut result = Vec::with_capacity(64);
+        result.extend(signature.to_le_bytes());
+        if self.version == VERSION_3 {
+            self.write_fields(&mut result, true);
+            let crc = crc32fast::hash(&result);
+            result.extend(MetaField::MetaHash(crc).to_bytes());
+        } else {
+            self.write_fields(&mut result, false);
         }
         result.push(0);
         result.push(0);
@@ -348,6 +378,25 @@ impl Meta {
         }
         Self {
             version: VERSION_2,
+            fields,
+        }
+    }
+
+    pub fn make_v3(size: Option<u32>, filename: Option<String>, hash: Option<u32>) -> Self {
+        let mut fields = Vec::new();
+        if let Some(size) = size {
+            fields.push(MetaField::Size(size));
+        }
+        if let Some(filename) = filename {
+            fields.push(MetaField::Filename(filename));
+        }
+        if let Some(hash) = hash {
+            fields.push(MetaField::Hash(hash));
+        }
+        // Placeholder; actual CRC is computed in `to_bytes`.
+        fields.push(MetaField::MetaHash(0));
+        Self {
+            version: VERSION_3,
             fields,
         }
     }
@@ -382,6 +431,17 @@ impl Meta {
                 }
                 Ok(Meta { version, fields })
             }
+            VERSION_3 => {
+                let mut fields = Vec::new();
+                loop {
+                    match MetaField::from_tlv_field(value)? {
+                        MetaFieldParseResult::Field(field) => fields.push(field),
+                        MetaFieldParseResult::End => break,
+                        MetaFieldParseResult::Skip => continue,
+                    }
+                }
+                Ok(Meta { version, fields })
+            }
             v => Err(MetaError::UnsupportedVersion(v)),
         }
     }
@@ -394,6 +454,9 @@ impl Meta {
     }
     pub fn hash(&self) -> Option<u32> {
         self.fields.iter().find_map(|f| f.as_hash())
+    }
+    pub fn meta_hash(&self) -> Option<u32> {
+        self.fields.iter().find_map(|f| f.as_meta_hash())
     }
 }
 
@@ -477,6 +540,7 @@ meta_tag_enum! {
     Size = 1,
     Filename = 2,
     Hash = 3,
+    MetaHash = 4,
 }
 
 fn inspect(args: InspectArgs) -> Result<(), InspectError> {
@@ -780,6 +844,25 @@ mod tests {
             "Filename after unknown tag must still be parsed"
         );
         assert_eq!(iter.next(), None, "stream must be fully consumed");
+    }
+
+    #[test]
+    fn test_meta_v3_roundtrip_with_header_hash() {
+        let meta = Meta::make_v3(
+            Some(4242),
+            Some("hello.bin".to_string()),
+            Some(0xDEADBEEF),
+        );
+        assert_eq!(meta.version, 3);
+        let bytes = meta.to_bytes();
+        let mut iter = bytes.into_iter();
+        let parsed = Meta::read(&mut iter).expect("v3 must parse");
+        assert_eq!(parsed.version, 3);
+        assert_eq!(parsed.size(), Some(4242));
+        assert_eq!(parsed.filename(), Some("hello.bin"));
+        assert_eq!(parsed.hash(), Some(0xDEADBEEF));
+        assert!(parsed.meta_hash().is_some(), "v3 must carry header hash");
+        assert_eq!(iter.next(), None);
     }
 
     #[test]
