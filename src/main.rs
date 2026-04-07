@@ -333,9 +333,15 @@ pub struct Meta {
 }
 
 impl Meta {
-    fn write_fields(&self, buf: &mut Vec<u8>, skip_meta_hash: bool) {
+    fn write_all_fields(&self, buf: &mut Vec<u8>) {
         for field in &self.fields {
-            if skip_meta_hash && field.as_meta_hash().is_some() {
+            buf.extend(field.to_bytes());
+        }
+    }
+
+    fn write_fields_excluding_meta_hash(&self, buf: &mut Vec<u8>) {
+        for field in &self.fields {
+            if field.as_meta_hash().is_some() {
                 continue;
             }
             buf.extend(field.to_bytes());
@@ -343,18 +349,24 @@ impl Meta {
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
+        // Only v2 and v3 are writable. v1 is read-only (legacy format) — `Meta::read` may
+        // return version=1, but no production caller writes such a value back out.
         let signature = match self.version {
+            VERSION_2 => (MAGIC << 3) | (VERSION_2 as u16),
             VERSION_3 => (MAGIC << 3) | (VERSION_3 as u16),
-            _ => (MAGIC << 3) | (VERSION_2 as u16),
+            v => unreachable!(
+                "Meta::to_bytes called with unsupported writer version {v}; \
+                 only VERSION_2 and VERSION_3 are writable"
+            ),
         };
         let mut result = Vec::with_capacity(64);
         result.extend(signature.to_le_bytes());
         if self.version == VERSION_3 {
-            self.write_fields(&mut result, true);
+            self.write_fields_excluding_meta_hash(&mut result);
             let crc = crc32fast::hash(&result);
             result.extend(MetaField::MetaHash(crc).to_bytes());
         } else {
-            self.write_fields(&mut result, false);
+            self.write_all_fields(&mut result);
         }
         result.push(0);
         result.push(0);
@@ -393,7 +405,9 @@ impl Meta {
         if let Some(hash) = hash {
             fields.push(MetaField::Hash(hash));
         }
-        // Placeholder; actual CRC is computed in `to_bytes`.
+        // MetaHash(0) is a placeholder. `Meta::to_bytes` skips this entry via
+        // `write_fields_excluding_meta_hash`, then computes the real CRC over the
+        // serialized prefix and appends a fresh MetaHash TLV with the correct value.
         fields.push(MetaField::MetaHash(0));
         Self {
             version: VERSION_3,
@@ -855,13 +869,25 @@ mod tests {
         );
         assert_eq!(meta.version, 3);
         let bytes = meta.to_bytes();
+        // Compute the expected CRC directly: it covers everything from the start of `bytes`
+        // up to (but not including) the MetaHash TLV. The MetaHash TLV at the tail is
+        // 6 bytes (tag + len + 4-byte value), and is followed by the 2-byte end marker.
+        let meta_hash_tlv_len = 1 /* tag */ + 1 /* len */ + 4 /* u32 */;
+        let end_marker_len = 2;
+        let covered_end = bytes.len() - end_marker_len - meta_hash_tlv_len;
+        let expected_crc = crc32fast::hash(&bytes[..covered_end]);
+
         let mut iter = bytes.into_iter();
         let parsed = Meta::read(&mut iter).expect("v3 must parse");
         assert_eq!(parsed.version, 3);
         assert_eq!(parsed.size(), Some(4242));
         assert_eq!(parsed.filename(), Some("hello.bin"));
         assert_eq!(parsed.hash(), Some(0xDEADBEEF));
-        assert!(parsed.meta_hash().is_some(), "v3 must carry header hash");
+        assert_eq!(
+            parsed.meta_hash(),
+            Some(expected_crc),
+            "MetaHash must equal CRC32 of the preceding header bytes"
+        );
         assert_eq!(iter.next(), None);
     }
 
