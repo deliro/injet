@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)]
+
 use assert_cmd::Command;
 use image::{ImageBuffer, Rgba};
 use rstest::rstest;
@@ -32,11 +34,11 @@ fn inspect_output(#[case] case: &str) {
     img.save(&png).unwrap();
 
     if case != "empty" {
-        let cargo_path = dir.path().join("hi.bin");
-        std::fs::write(&cargo_path, b"hello world").unwrap();
+        let payload_path = dir.path().join("hi.bin");
+        std::fs::write(&payload_path, b"hello world").unwrap();
         let mut inj = vec![
             "inject".to_string(),
-            cargo_path.to_string_lossy().into_owned(),
+            payload_path.to_string_lossy().into_owned(),
             png.to_string_lossy().into_owned(),
             "-d".into(),
             png.to_string_lossy().into_owned(),
@@ -45,7 +47,7 @@ fn inspect_output(#[case] case: &str) {
             inj.push("--seed".into());
             inj.push("s".into());
         }
-        let inj_refs: Vec<&str> = inj.iter().map(|s| s.as_str()).collect();
+        let inj_refs: Vec<&str> = inj.iter().map(String::as_str).collect();
         Command::cargo_bin("injet")
             .unwrap()
             .args(&inj_refs)
@@ -55,7 +57,9 @@ fn inspect_output(#[case] case: &str) {
 
     if case == "corrupted_payload" {
         let mut img = image::open(&png).unwrap().into_rgba8();
-        img.get_pixel_mut(0, 70).0[0] ^= 1;
+        let pixel = img.get_pixel_mut(0, 70);
+        let channel = pixel.0.get_mut(0).unwrap();
+        *channel ^= 1;
         img.save(&png).unwrap();
     }
 
@@ -64,7 +68,7 @@ fn inspect_output(#[case] case: &str) {
         args.push("--seed".into());
         args.push("s".into());
     }
-    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let stdout = run_inspect(&arg_refs);
     insta::assert_snapshot!(case, stdout);
 }

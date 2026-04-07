@@ -5,32 +5,24 @@ pub const VERSION_1: u8 = 1;
 pub const VERSION_2: u8 = 2;
 pub const VERSION_3: u8 = 3;
 
-#[inline]
-fn to_bits(val: u8) -> [u8; 8] {
-    [
-        (val >> 7) & 1,
-        (val >> 6) & 1,
-        (val >> 5) & 1,
-        (val >> 4) & 1,
-        (val >> 3) & 1,
-        (val >> 2) & 1,
-        (val >> 1) & 1,
-        val & 1,
-    ]
-}
+const META_HASH_TLV_LEN: usize = 6;
 
-#[repr(u8)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum MetaTag {
-    Size = 1,
-    Filename = 2,
-    Hash = 3,
-    MetaHash = 4,
+    Size,
+    Filename,
+    Hash,
+    MetaHash,
 }
 
 impl From<MetaTag> for u8 {
     fn from(tag: MetaTag) -> u8 {
-        tag as u8
+        match tag {
+            MetaTag::Size => 1,
+            MetaTag::Filename => 2,
+            MetaTag::Hash => 3,
+            MetaTag::MetaHash => 4,
+        }
     }
 }
 
@@ -70,35 +62,68 @@ impl MetaField {
             MetaField::MetaHash(_) => MetaTag::MetaHash,
         }
     }
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut result = vec![u8::from(self.tag())];
-        let value = match self {
-            MetaField::Size(sz) => sz.to_le_bytes().to_vec(),
-            MetaField::Filename(s) => s.as_bytes().to_vec(),
-            MetaField::Hash(h) => h.to_le_bytes().to_vec(),
-            MetaField::MetaHash(h) => h.to_le_bytes().to_vec(),
-        };
-        if value.len() > 255 {
-            result.push(0x00);
-            result.extend((value.len() as u16).to_le_bytes());
-        } else {
-            result.push(value.len() as u8);
+
+    fn value_len(&self) -> usize {
+        match self {
+            MetaField::Size(_) | MetaField::Hash(_) | MetaField::MetaHash(_) => 4,
+            MetaField::Filename(s) => s.len(),
         }
-        result.extend(value);
-        result
     }
+
+    /// Appends the TLV encoding of this field to `out`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MetaError::FieldTooLong`] if the value byte length exceeds [`u16::MAX`].
+    pub fn write_into(&self, out: &mut Vec<u8>) -> Result<(), MetaError> {
+        let value_len = self.value_len();
+        out.push(u8::from(self.tag()));
+        if value_len > usize::from(u8::MAX) {
+            let len_u16 = u16::try_from(value_len).map_err(|_| MetaError::FieldTooLong)?;
+            out.push(0x00);
+            out.extend(len_u16.to_le_bytes());
+        } else {
+            // value_len <= 255 — fits in u8
+            let len_u8 = u8::try_from(value_len).map_err(|_| MetaError::FieldTooLong)?;
+            out.push(len_u8);
+        }
+        match self {
+            MetaField::Size(sz) => out.extend(sz.to_le_bytes()),
+            MetaField::Filename(s) => out.extend(s.as_bytes()),
+            MetaField::Hash(h) | MetaField::MetaHash(h) => out.extend(h.to_le_bytes()),
+        }
+        Ok(())
+    }
+
+    /// Encodes a single TLV field into a freshly allocated `Vec<u8>`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MetaError::FieldTooLong`] if the value byte length exceeds [`u16::MAX`].
+    pub fn to_bytes(&self) -> Result<Vec<u8>, MetaError> {
+        let mut out = Vec::with_capacity(self.value_len().saturating_add(4));
+        self.write_into(&mut out)?;
+        Ok(out)
+    }
+
     fn read_tlv_len<T: Iterator<Item = u8>>(
         iter: &mut T,
         first_len_byte: u8,
     ) -> Result<usize, MetaError> {
         if first_len_byte != 0 {
-            return Ok(first_len_byte as usize);
+            return Ok(usize::from(first_len_byte));
         }
-        let hi = iter.next().ok_or(MetaError::NoBytes)?;
         let lo = iter.next().ok_or(MetaError::NoBytes)?;
-        Ok(u16::from_le_bytes([hi, lo]) as usize)
+        let hi = iter.next().ok_or(MetaError::NoBytes)?;
+        Ok(usize::from(u16::from_le_bytes([lo, hi])))
     }
 
+    /// Parses a TLV field from a byte iterator.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`MetaError`] when the iterator is exhausted prematurely or the field
+    /// value is malformed (bad UTF-8, wrong length, etc).
     pub fn from_tlv_field<T: Iterator<Item = u8>>(
         iter: &mut T,
     ) -> Result<MetaFieldParseResult, MetaError> {
@@ -112,18 +137,19 @@ impl MetaField {
         if bytes.len() != actual_len {
             return Err(MetaError::NoBytes);
         }
-        let tag = match MetaTag::try_from(tag_byte) {
-            Ok(t) => t,
-            Err(_) => return Ok(MetaFieldParseResult::Skip),
+        let Ok(tag) = MetaTag::try_from(tag_byte) else {
+            return Ok(MetaFieldParseResult::Skip);
         };
         let field = match tag {
-            MetaTag::Size => MetaField::Size(parse_u32_field(bytes)?),
+            MetaTag::Size => MetaField::Size(parse_u32_field(&bytes)?),
             MetaTag::Filename => MetaField::Filename(parse_filename(bytes)?),
-            MetaTag::Hash => MetaField::Hash(parse_u32_field(bytes)?),
-            MetaTag::MetaHash => MetaField::MetaHash(parse_u32_field(bytes)?),
+            MetaTag::Hash => MetaField::Hash(parse_u32_field(&bytes)?),
+            MetaTag::MetaHash => MetaField::MetaHash(parse_u32_field(&bytes)?),
         };
         Ok(MetaFieldParseResult::Field(field))
     }
+
+    #[must_use]
     pub fn as_size(&self) -> Option<u32> {
         if let MetaField::Size(sz) = self {
             Some(*sz)
@@ -131,6 +157,8 @@ impl MetaField {
             None
         }
     }
+
+    #[must_use]
     pub fn as_filename(&self) -> Option<&str> {
         if let MetaField::Filename(s) = self {
             Some(s)
@@ -138,6 +166,8 @@ impl MetaField {
             None
         }
     }
+
+    #[must_use]
     pub fn as_hash(&self) -> Option<u32> {
         if let MetaField::Hash(h) = self {
             Some(*h)
@@ -145,6 +175,8 @@ impl MetaField {
             None
         }
     }
+
+    #[must_use]
     pub fn as_meta_hash(&self) -> Option<u32> {
         if let MetaField::MetaHash(h) = self {
             Some(*h)
@@ -152,22 +184,31 @@ impl MetaField {
             None
         }
     }
+
+    /// Parses the legacy v1 fixed header (size + optional filename).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MetaError::NoBytes`] when the iterator is exhausted prematurely or
+    /// [`MetaError::MalformedFilename`] when the filename payload is invalid UTF-8.
     pub fn from_v1_header<T: Iterator<Item = u8>>(
         iter: &mut T,
     ) -> Result<Vec<MetaField>, MetaError> {
-        let header_rest: Vec<u8> = iter.take(5).collect();
-        if header_rest.len() != 5 {
-            return Err(MetaError::NoBytes);
+        let mut header = [0_u8; 5];
+        for slot in &mut header {
+            *slot = iter.next().ok_or(MetaError::NoBytes)?;
         }
-        let size = u32::from_le_bytes(header_rest[0..4].try_into().unwrap());
-        let filename_size = match header_rest[4] {
+        let [s0, s1, s2, s3, fn_size_byte] = header;
+        let size = u32::from_le_bytes([s0, s1, s2, s3]);
+        let filename_size = match fn_size_byte {
             0xFF => None,
             sz => Some(sz),
         };
         let mut fields = vec![MetaField::Size(size)];
         if let Some(sz) = filename_size {
-            let filename_vec = iter.take(sz as usize).collect::<Vec<u8>>();
-            if filename_vec.len() as u8 != sz {
+            let take_n = usize::from(sz);
+            let filename_vec: Vec<u8> = iter.take(take_n).collect();
+            if filename_vec.len() != take_n {
                 return Err(MetaError::MalformedFilename);
             }
             fields.push(MetaField::Filename(parse_filename(filename_vec)?));
@@ -180,11 +221,8 @@ fn parse_filename(bytes: Vec<u8>) -> Result<String, MetaError> {
     String::from_utf8(bytes).map_err(|_| MetaError::MalformedFilename)
 }
 
-fn parse_u32_field(bytes: Vec<u8>) -> Result<u32, MetaError> {
-    let array: [u8; 4] = bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| MetaError::MalformedField)?;
+fn parse_u32_field(bytes: &[u8]) -> Result<u32, MetaError> {
+    let array: [u8; 4] = bytes.try_into().map_err(|_| MetaError::MalformedField)?;
     Ok(u32::from_le_bytes(array))
 }
 
@@ -195,50 +233,53 @@ pub struct Meta {
 }
 
 impl Meta {
-    fn write_all_fields(&self, buf: &mut Vec<u8>) {
+    fn write_all_fields(&self, buf: &mut Vec<u8>) -> Result<(), MetaError> {
         for field in &self.fields {
-            buf.extend(field.to_bytes());
+            field.write_into(buf)?;
         }
+        Ok(())
     }
 
-    fn write_fields_excluding_meta_hash(&self, buf: &mut Vec<u8>) {
+    fn write_fields_excluding_meta_hash(&self, buf: &mut Vec<u8>) -> Result<(), MetaError> {
         for field in &self.fields {
             if field.as_meta_hash().is_some() {
                 continue;
             }
-            buf.extend(field.to_bytes());
+            field.write_into(buf)?;
         }
+        Ok(())
     }
 
-    pub fn to_bytes(&self) -> Vec<u8> {
-        // Only v2 and v3 are writable. v1 is read-only (legacy format) — `Meta::read` may
-        // return version=1, but no production caller writes such a value back out.
-        let signature = match self.version {
-            VERSION_2 => (MAGIC << 3) | (VERSION_2 as u16),
-            VERSION_3 => (MAGIC << 3) | (VERSION_3 as u16),
-            v => unreachable!(
-                "Meta::to_bytes called with unsupported writer version {v}; \
-                 only VERSION_2 and VERSION_3 are writable"
-            ),
+    /// Serializes the metadata header.
+    ///
+    /// Only versions 2 and 3 are writable. v1 is read-only legacy format —
+    /// `Meta::read` may return version=1, but no production caller writes such a value back.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MetaError::UnsupportedWriteVersion`] for any version other than 2 or 3,
+    /// or [`MetaError::FieldTooLong`] when an embedded field exceeds the TLV length limit.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, MetaError> {
+        let signature: u16 = match self.version {
+            VERSION_2 => (MAGIC << 3_u32) | u16::from(VERSION_2),
+            VERSION_3 => (MAGIC << 3_u32) | u16::from(VERSION_3),
+            v => return Err(MetaError::UnsupportedWriteVersion(v)),
         };
         let mut result = Vec::with_capacity(64);
         result.extend(signature.to_le_bytes());
         if self.version == VERSION_3 {
-            self.write_fields_excluding_meta_hash(&mut result);
+            self.write_fields_excluding_meta_hash(&mut result)?;
             let crc = crc32fast::hash(&result);
-            result.extend(MetaField::MetaHash(crc).to_bytes());
+            MetaField::MetaHash(crc).write_into(&mut result)?;
         } else {
-            self.write_all_fields(&mut result);
+            self.write_all_fields(&mut result)?;
         }
         result.push(0);
         result.push(0);
-        result
+        Ok(result)
     }
 
-    pub fn to_bits(&self) -> impl Iterator<Item = u8> {
-        self.to_bytes().into_iter().flat_map(to_bits)
-    }
-
+    #[must_use]
     pub fn make(size: Option<u32>, filename: Option<String>, hash: Option<u32>) -> Self {
         let mut fields = Vec::new();
         if let Some(size) = size {
@@ -256,6 +297,7 @@ impl Meta {
         }
     }
 
+    #[must_use]
     pub fn make_v3(size: Option<u32>, filename: Option<String>, hash: Option<u32>) -> Self {
         let mut fields = Vec::new();
         if let Some(size) = size {
@@ -277,20 +319,25 @@ impl Meta {
         }
     }
 
+    /// Reads a metadata header from a byte iterator.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`MetaError`] for malformed signatures, unsupported versions, premature
+    /// end-of-stream, header CRC mismatch, or malformed individual fields.
     pub fn read<T>(value: &mut T) -> Result<Self, MetaError>
     where
         T: Iterator<Item = u8>,
     {
-        let sig_bytes: Vec<u8> = value.take(2).collect();
-        if sig_bytes.len() != 2 {
-            return Err(MetaError::NoBytes);
-        }
-        let signature = u16::from_le_bytes([sig_bytes[0], sig_bytes[1]]);
-        let sign = signature >> 3;
+        let sig0 = value.next().ok_or(MetaError::NoBytes)?;
+        let sig1 = value.next().ok_or(MetaError::NoBytes)?;
+        let signature = u16::from_le_bytes([sig0, sig1]);
+        let sign = signature >> 3_u32;
         if sign != MAGIC {
             return Err(MetaError::SignatureMismatch);
         }
-        let version = (signature & 0b111) as u8;
+        let version_low = signature & 0b0000_0111_u16;
+        let version = u8::try_from(version_low).map_err(|_| MetaError::MalformedField)?;
         match version {
             VERSION_1 => {
                 let fields = MetaField::from_v1_header(value)?;
@@ -302,95 +349,109 @@ impl Meta {
                     match MetaField::from_tlv_field(value)? {
                         MetaFieldParseResult::Field(field) => fields.push(field),
                         MetaFieldParseResult::End => break,
-                        MetaFieldParseResult::Skip => continue,
+                        MetaFieldParseResult::Skip => {}
                     }
                 }
                 Ok(Meta { version, fields })
             }
-            VERSION_3 => {
-                // Buffer the v3 header TLV-by-TLV. We need the raw bytes for CRC,
-                // and we record the MetaHash offset in the same pass to avoid a
-                // re-scan. A byte-by-byte scan for `0x00 0x00` would be unsound
-                // because TLV values legitimately contain zero bytes (e.g. a
-                // `u32` Size payload).
-                let mut body: Vec<u8> = Vec::with_capacity(64);
-                body.extend(sig_bytes.iter().copied());
-                let mut meta_hash_offset: Option<usize> = None;
-                loop {
-                    let field_start = body.len();
-                    let tag = value.next().ok_or(MetaError::NoBytes)?;
-                    let len_byte = value.next().ok_or(MetaError::NoBytes)?;
-                    if tag == 0 && len_byte == 0 {
-                        // End marker — NOT pushed into `body` (CRC scope ends here).
-                        break;
-                    }
-                    body.push(tag);
-                    body.push(len_byte);
-                    let value_len = if len_byte == 0 {
-                        let lo = value.next().ok_or(MetaError::NoBytes)?;
-                        let hi = value.next().ok_or(MetaError::NoBytes)?;
-                        body.push(lo);
-                        body.push(hi);
-                        u16::from_le_bytes([lo, hi]) as usize
-                    } else {
-                        len_byte as usize
-                    };
-                    for _ in 0..value_len {
-                        let b = value.next().ok_or(MetaError::NoBytes)?;
-                        body.push(b);
-                    }
-                    if tag == u8::from(MetaTag::MetaHash) && meta_hash_offset.is_none() {
-                        meta_hash_offset = Some(field_start);
-                    }
-                }
-                let meta_hash_offset = meta_hash_offset.ok_or(MetaError::MetaHashMissing)?;
-
-                // CRC covers everything BEFORE the MetaHash TLV.
-                if meta_hash_offset + 6 > body.len() {
-                    return Err(MetaError::NoBytes);
-                }
-                let covered = &body[..meta_hash_offset];
-                let expected_crc = u32::from_le_bytes([
-                    body[meta_hash_offset + 2],
-                    body[meta_hash_offset + 3],
-                    body[meta_hash_offset + 4],
-                    body[meta_hash_offset + 5],
-                ]);
-                if crc32fast::hash(covered) != expected_crc {
-                    return Err(MetaError::HeaderHashMismatch);
-                }
-
-                // Re-parse the verified body via `from_tlv_field`. Re-append the
-                // end marker so the End sentinel fires.
-                let mut parse_buf: Vec<u8> = body[2..].to_vec();
-                parse_buf.push(0);
-                parse_buf.push(0);
-                let mut iter = parse_buf.into_iter();
-                let mut fields = Vec::new();
-                loop {
-                    match MetaField::from_tlv_field(&mut iter)? {
-                        MetaFieldParseResult::Field(field) => fields.push(field),
-                        MetaFieldParseResult::End => break,
-                        MetaFieldParseResult::Skip => continue,
-                    }
-                }
-                Ok(Meta { version, fields })
-            }
+            VERSION_3 => Self::read_v3(value, [sig0, sig1]),
             v => Err(MetaError::UnsupportedVersion(v)),
         }
     }
 
+    fn read_v3<T>(value: &mut T, sig_bytes: [u8; 2]) -> Result<Self, MetaError>
+    where
+        T: Iterator<Item = u8>,
+    {
+        // Buffer the v3 header TLV-by-TLV. We need the raw bytes for CRC,
+        // and we record the MetaHash offset in the same pass to avoid a
+        // re-scan. A byte-by-byte scan for `0x00 0x00` would be unsound
+        // because TLV values legitimately contain zero bytes (e.g. a
+        // `u32` Size payload).
+        let mut body: Vec<u8> = Vec::with_capacity(64);
+        body.extend(sig_bytes);
+        let mut meta_hash_offset: Option<usize> = None;
+        loop {
+            let field_start = body.len();
+            let tag = value.next().ok_or(MetaError::NoBytes)?;
+            let len_byte = value.next().ok_or(MetaError::NoBytes)?;
+            if tag == 0 && len_byte == 0 {
+                // End marker — NOT pushed into `body` (CRC scope ends here).
+                break;
+            }
+            body.push(tag);
+            body.push(len_byte);
+            let value_len = if len_byte == 0 {
+                let lo = value.next().ok_or(MetaError::NoBytes)?;
+                let hi = value.next().ok_or(MetaError::NoBytes)?;
+                body.push(lo);
+                body.push(hi);
+                usize::from(u16::from_le_bytes([lo, hi]))
+            } else {
+                usize::from(len_byte)
+            };
+            for _ in 0..value_len {
+                let next_byte = value.next().ok_or(MetaError::NoBytes)?;
+                body.push(next_byte);
+            }
+            if tag == u8::from(MetaTag::MetaHash) && meta_hash_offset.is_none() {
+                meta_hash_offset = Some(field_start);
+            }
+        }
+        let meta_hash_offset = meta_hash_offset.ok_or(MetaError::MetaHashMissing)?;
+
+        // CRC covers everything BEFORE the MetaHash TLV.
+        let meta_hash_end = meta_hash_offset
+            .checked_add(META_HASH_TLV_LEN)
+            .ok_or(MetaError::NoBytes)?;
+        let covered = body.get(..meta_hash_offset).ok_or(MetaError::NoBytes)?;
+        let meta_hash_tlv = body
+            .get(meta_hash_offset..meta_hash_end)
+            .ok_or(MetaError::NoBytes)?;
+        let &[_, _, c0, c1, c2, c3] = meta_hash_tlv else {
+            return Err(MetaError::NoBytes);
+        };
+        let expected_crc = u32::from_le_bytes([c0, c1, c2, c3]);
+        if crc32fast::hash(covered) != expected_crc {
+            return Err(MetaError::HeaderHashMismatch);
+        }
+
+        // Re-parse the verified body via `from_tlv_field`. Re-append the
+        // end marker so the End sentinel fires.
+        let body_after_sig = body.get(2..).ok_or(MetaError::NoBytes)?;
+        let mut iter = body_after_sig.iter().copied().chain([0_u8, 0_u8]);
+        let mut fields = Vec::new();
+        loop {
+            match MetaField::from_tlv_field(&mut iter)? {
+                MetaFieldParseResult::Field(field) => fields.push(field),
+                MetaFieldParseResult::End => break,
+                MetaFieldParseResult::Skip => {}
+            }
+        }
+        Ok(Meta {
+            version: VERSION_3,
+            fields,
+        })
+    }
+
+    #[must_use]
     pub fn size(&self) -> Option<u32> {
-        self.fields.iter().find_map(|f| f.as_size())
+        self.fields.iter().find_map(MetaField::as_size)
     }
+
+    #[must_use]
     pub fn filename(&self) -> Option<&str> {
-        self.fields.iter().find_map(|f| f.as_filename())
+        self.fields.iter().find_map(MetaField::as_filename)
     }
+
+    #[must_use]
     pub fn hash(&self) -> Option<u32> {
-        self.fields.iter().find_map(|f| f.as_hash())
+        self.fields.iter().find_map(MetaField::as_hash)
     }
+
+    #[must_use]
     pub fn meta_hash(&self) -> Option<u32> {
-        self.fields.iter().find_map(|f| f.as_meta_hash())
+        self.fields.iter().find_map(MetaField::as_meta_hash)
     }
 }
 
@@ -402,6 +463,8 @@ pub enum MetaError {
     SignatureMismatch,
     #[error("Unsupported metadata version: {0}")]
     UnsupportedVersion(u8),
+    #[error("Cannot serialize metadata version {0}: writer supports v2 and v3 only")]
+    UnsupportedWriteVersion(u8),
     #[error("Invalid or corrupted filename in metadata")]
     MalformedFilename,
     #[error("Metadata header CRC mismatch")]
@@ -410,35 +473,40 @@ pub enum MetaError {
     MetaHashMissing,
     #[error("Malformed metadata field")]
     MalformedField,
+    #[error("Metadata field value exceeds maximum TLV length")]
+    FieldTooLong,
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::{Meta, MAGIC, VERSION_1, VERSION_2};
     use rstest::rstest;
 
     fn build_v1_bytes() -> Vec<u8> {
         let mut bytes = Vec::new();
-        let signature = (MAGIC << 3) | (VERSION_1 as u16);
+        let signature = (MAGIC << 3_u32) | u16::from(VERSION_1);
         bytes.extend(signature.to_le_bytes());
-        bytes.extend(1231234u32.to_le_bytes());
+        bytes.extend(1_231_234_u32.to_le_bytes());
         let filename = b"hello.zip";
-        bytes.push(filename.len() as u8);
+        bytes.push(u8::try_from(filename.len()).unwrap());
         bytes.extend(filename);
         bytes
     }
 
     fn build_v2_roundtrip() -> Vec<u8> {
-        Meta::make(Some(1231234), Some("hello.zip".into()), Some(u32::MAX)).to_bytes()
+        Meta::make(Some(1_231_234), Some("hello.zip".into()), Some(u32::MAX))
+            .to_bytes()
+            .unwrap()
     }
 
     fn build_v2_unknown_tlv() -> Vec<u8> {
         let mut bytes = Vec::new();
-        let signature = (MAGIC << 3) | (VERSION_2 as u16);
+        let signature = (MAGIC << 3_u32) | u16::from(VERSION_2);
         bytes.extend(signature.to_le_bytes());
         bytes.push(1);
         bytes.push(4);
-        bytes.extend(1234u32.to_le_bytes());
+        bytes.extend(1234_u32.to_le_bytes());
         bytes.push(0x7F);
         bytes.push(5);
         bytes.extend([0xAA, 0xBB, 0xCC, 0xDD, 0xEE]);
@@ -451,22 +519,28 @@ mod tests {
     }
 
     fn build_v3_roundtrip() -> Vec<u8> {
-        Meta::make_v3(Some(4242), Some("hello.bin".into()), Some(0xDEADBEEF)).to_bytes()
+        Meta::make_v3(Some(4242), Some("hello.bin".into()), Some(0xDEAD_BEEF))
+            .to_bytes()
+            .unwrap()
     }
 
     fn build_v3_tampered() -> Vec<u8> {
-        let mut bytes = Meta::make_v3(Some(123), Some("a.bin".into()), Some(0)).to_bytes();
-        bytes[12] ^= 0x01;
+        let mut bytes = Meta::make_v3(Some(123), Some("a.bin".into()), Some(0))
+            .to_bytes()
+            .unwrap();
+        if let Some(b) = bytes.get_mut(12) {
+            *b ^= 0x01;
+        }
         bytes
     }
 
     fn build_v2_bad_utf8() -> Vec<u8> {
         let mut bytes = Vec::new();
-        let signature = (MAGIC << 3) | (VERSION_2 as u16);
+        let signature = (MAGIC << 3_u32) | u16::from(VERSION_2);
         bytes.extend(signature.to_le_bytes());
         bytes.push(2);
         bytes.push(3);
-        bytes.extend(&[0xFF, 0xFE, 0xFD]);
+        bytes.extend([0xFF, 0xFE, 0xFD]);
         bytes.push(0);
         bytes.push(0);
         bytes
@@ -474,11 +548,11 @@ mod tests {
 
     fn build_v2_bad_size() -> Vec<u8> {
         let mut bytes = Vec::new();
-        let signature = (MAGIC << 3) | (VERSION_2 as u16);
+        let signature = (MAGIC << 3_u32) | u16::from(VERSION_2);
         bytes.extend(signature.to_le_bytes());
         bytes.push(1);
         bytes.push(3);
-        bytes.extend(&[0, 0, 0]);
+        bytes.extend([0, 0, 0]);
         bytes.push(0);
         bytes.push(0);
         bytes

@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)]
+
 use assert_cmd::Command;
 use image::{ImageBuffer, Rgba};
 use std::path::PathBuf;
@@ -5,16 +7,15 @@ use tempfile::tempdir;
 
 fn embed_bits_into_png(png: &mut ImageBuffer<Rgba<u8>, Vec<u8>>, bits: &[u8]) {
     let (w, h) = (png.width(), png.height());
-    let mut idx = 0;
+    let mut bit_iter = bits.iter().copied();
     'outer: for x in 0..w {
         for y in 0..h {
-            let p = png.get_pixel_mut(x, y);
-            for c in 0..4 {
-                if idx >= bits.len() {
+            let pixel = png.get_pixel_mut(x, y);
+            for channel in &mut pixel.0 {
+                let Some(bit) = bit_iter.next() else {
                     break 'outer;
-                }
-                p.0[c] = (p.0[c] & 0xFE) | (bits[idx] & 1);
-                idx += 1;
+                };
+                *channel = (*channel & 0xFE) | (bit & 1);
             }
         }
     }
@@ -23,7 +24,7 @@ fn embed_bits_into_png(png: &mut ImageBuffer<Rgba<u8>, Vec<u8>>, bits: &[u8]) {
 fn bits(bytes: &[u8]) -> Vec<u8> {
     bytes
         .iter()
-        .flat_map(|b| (0..8).rev().map(move |i| (b >> i) & 1))
+        .flat_map(|b| (0_u8..8).rev().map(move |i| (b >> i) & 1))
         .collect()
 }
 
@@ -40,13 +41,15 @@ fn extract_reads_legacy_v1_format() {
     //   size       = u32 little-endian (4 bytes)
     //   filename_len (u8, 0xFF means "no filename")
     //   filename bytes
-    let signature = (MAGIC << 3) | (VERSION_1 as u16);
+    let signature = (MAGIC << 3_u32) | u16::from(VERSION_1);
     let payload = b"hello";
     let mut meta = Vec::new();
     meta.extend(signature.to_le_bytes());
-    meta.extend((payload.len() as u32).to_le_bytes());
+    let payload_len = u32::try_from(payload.len()).unwrap();
+    meta.extend(payload_len.to_le_bytes());
     let filename = b"hi.bin";
-    meta.push(filename.len() as u8);
+    let filename_len = u8::try_from(filename.len()).unwrap();
+    meta.push(filename_len);
     meta.extend(filename);
 
     // Concatenate meta and payload bits (MSB-first per byte, matching the production encoder).

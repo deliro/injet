@@ -2,6 +2,7 @@ use itertools::Itertools;
 
 pub type Seed = String;
 
+#[must_use]
 #[inline]
 pub fn to_bits(val: u8) -> [u8; 8] {
     [
@@ -17,70 +18,91 @@ pub fn to_bits(val: u8) -> [u8; 8] {
 }
 
 #[inline]
-pub fn iter_dots(w: u32, h: u32) -> impl Iterator<Item = (u32, u32)> {
-    (0..w).cartesian_product(0..h)
+pub fn iter_dots(width: u32, height: u32) -> impl Iterator<Item = (u32, u32)> {
+    (0..width).cartesian_product(0..height)
 }
 
 fn seed_to_array(seed: &str) -> [u8; 32] {
     *blake3::hash(seed.as_bytes()).as_bytes()
 }
 
-pub fn pseudo_shuffle_coords(w: u32, h: u32, seed: &Seed) -> impl Iterator<Item = (u32, u32)> {
-    let n = u64::from(w) * u64::from(h);
+pub fn pseudo_shuffle_coords(
+    width: u32,
+    height: u32,
+    seed: &Seed,
+) -> impl Iterator<Item = (u32, u32)> {
+    let total_pixels = u64::from(width).saturating_mul(u64::from(height));
     // Round total bits up to an even number so Feistel halves are symmetric.
-    let bits_min = if n <= 1 { 2 } else { 64 - (n - 1).leading_zeros() };
-    let bits_even = if bits_min % 2 == 0 {
+    let bits_min: u32 = if total_pixels <= 1 {
+        2
+    } else {
+        64_u32.saturating_sub(total_pixels.saturating_sub(1).leading_zeros())
+    };
+    let bits_even = if bits_min.is_multiple_of(2) {
         bits_min
     } else {
-        bits_min + 1
+        bits_min.saturating_add(1)
     };
     let bits = bits_even.max(2);
     let half = bits / 2;
-    let mask = if half >= 64 { u64::MAX } else { (1u64 << half) - 1 };
-    let total = if bits >= 64 { u64::MAX } else { 1u64 << bits };
+    let mask = if half >= 64 {
+        u64::MAX
+    } else {
+        (1_u64 << half).saturating_sub(1)
+    };
+    let total_space = if bits >= 64 { u64::MAX } else { 1_u64 << bits };
     let key = seed_to_array(seed);
+    let height_u64 = u64::from(height);
 
-    let round_fn = move |x: u64, r: u32| -> u64 {
+    let round_fn = move |value: u64, round: u8| -> u64 {
         let mut hasher = blake3::Hasher::new();
         hasher.update(&key);
-        hasher.update(&[r as u8]);
-        hasher.update(&x.to_le_bytes());
-        let bytes = hasher.finalize();
-        let mut buf = [0u8; 8];
-        buf.copy_from_slice(&bytes.as_bytes()[..8]);
+        hasher.update(&[round]);
+        hasher.update(&value.to_le_bytes());
+        let hash = hasher.finalize();
+        let hash_bytes = hash.as_bytes();
+        let buf: [u8; 8] = hash_bytes
+            .get(..8)
+            .and_then(|s| s.try_into().ok())
+            .unwrap_or_default();
         u64::from_le_bytes(buf) & mask
     };
 
-    let feistel = move |x: u64| -> u64 {
-        let mut l = (x >> half) & mask;
-        let mut r = x & mask;
-        for round in 0..4u32 {
-            let new_l = r;
-            let new_r = l ^ round_fn(r, round);
-            l = new_l;
-            r = new_r;
+    let feistel = move |input: u64| -> u64 {
+        let mut left = (input >> half) & mask;
+        let mut right = input & mask;
+        for round in 0_u8..4 {
+            let new_left = right;
+            let new_right = left ^ round_fn(right, round);
+            left = new_left;
+            right = new_right;
         }
-        (l << half) | r
+        (left << half) | right
     };
 
-    (0..total)
+    (0..total_space)
         .map(feistel)
-        .filter(move |v| *v < n)
-        .map(move |v| {
-            let x = (v / u64::from(h)) as u32;
-            let y = (v % u64::from(h)) as u32;
-            (x, y)
+        .filter(move |value| *value < total_pixels)
+        .filter_map(move |value| {
+            let x = value
+                .checked_div(height_u64)
+                .and_then(|v| u32::try_from(v).ok())?;
+            let y = value
+                .checked_rem(height_u64)
+                .and_then(|v| u32::try_from(v).ok())?;
+            Some((x, y))
         })
 }
 
-pub fn gen_dots(w: u32, h: u32, seed: Option<&Seed>) -> impl Iterator<Item = (u32, u32)> {
+pub fn gen_dots(width: u32, height: u32, seed: Option<&Seed>) -> impl Iterator<Item = (u32, u32)> {
     match seed {
-        Some(seed) => itertools::Either::Left(pseudo_shuffle_coords(w, h, seed)),
-        None => itertools::Either::Right(iter_dots(w, h)),
+        Some(seed) => itertools::Either::Left(pseudo_shuffle_coords(width, height, seed)),
+        None => itertools::Either::Right(iter_dots(width, height)),
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::pseudo_shuffle_coords;
 
@@ -93,7 +115,7 @@ mod tests {
         assert_ne!(a, c, "different seed must yield different order");
         // Permutation property: every coordinate appears exactly once.
         let mut sorted = a.clone();
-        sorted.sort();
+        sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), 400);
     }

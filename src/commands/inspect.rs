@@ -13,21 +13,31 @@ const MB: u32 = 1024 * 1024;
 const MB_MINUS_1: u32 = MB - 1;
 const GB: u32 = MB * 1024;
 const GB_MINUS_1: u32 = GB - 1;
+const READ_BUFFER_SIZE: usize = 8192;
+
+fn fmt_with_unit(size: u32, divisor: u32, unit: &str) -> String {
+    let whole = size.checked_div(divisor).unwrap_or(0);
+    let remainder = size.checked_rem(divisor).unwrap_or(0);
+    let scaled = u64::from(remainder).saturating_mul(100);
+    let frac = u32::try_from(scaled.checked_div(u64::from(divisor)).unwrap_or(0)).unwrap_or(0);
+    format!("{whole}.{frac:02} {unit}")
+}
 
 #[inline]
 fn format_size(size: u32) -> String {
     match size {
-        (GB..=u32::MAX) => format!("{:.2} GB", (size as f32) / (GB as f32)),
-        (MB..=GB_MINUS_1) => format!("{:.2} MB", (size as f32) / (MB as f32)),
-        (KB..=MB_MINUS_1) => format!("{:.2} KB", (size as f32) / (KB as f32)),
+        GB..=u32::MAX => fmt_with_unit(size, GB, "GB"),
+        MB..=GB_MINUS_1 => fmt_with_unit(size, MB, "MB"),
+        KB..=MB_MINUS_1 => fmt_with_unit(size, KB, "KB"),
         _ => format!("{size} bytes"),
     }
 }
 
 pub(crate) fn display_path(path: &Path) -> String {
-    path.file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.to_string_lossy().into_owned())
+    path.file_name().map_or_else(
+        || path.to_string_lossy().into_owned(),
+        |n| n.to_string_lossy().into_owned(),
+    )
 }
 
 #[derive(Debug, Error)]
@@ -40,7 +50,13 @@ pub enum InspectError {
     NotAFile,
 }
 
-pub fn inspect(args: InspectArgs) -> Result<(), InspectError> {
+/// Inspects a container image, printing its dimensions, capacity, and any embedded metadata.
+///
+/// # Errors
+///
+/// Returns an [`InspectError`] when the path does not exist, is not a regular file, or
+/// cannot be decoded as an image.
+pub fn inspect(args: &InspectArgs) -> Result<(), InspectError> {
     if !args.path.exists() {
         return Err(InspectError::FileNotExist);
     }
@@ -51,75 +67,87 @@ pub fn inspect(args: InspectArgs) -> Result<(), InspectError> {
 
     let filename = display_path(&args.path);
     let img = image::open(&args.path).map_err(|_| InspectError::NotAnImage)?;
-    let (w, h) = img.dimensions();
-    let max_cargo_size = format_size((w * h * 4) / 8);
-    let bytes = gen_dots(w, h, args.seed.as_ref())
+    let (width, height) = img.dimensions();
+    let pixel_count = u64::from(width).saturating_mul(u64::from(height));
+    let max_payload_bytes = pixel_count.saturating_mul(4).checked_div(8).unwrap_or(0);
+    let max_payload_size = format_size(u32::try_from(max_payload_bytes).unwrap_or(u32::MAX));
+    let bytes = gen_dots(width, height, args.seed.as_ref())
         .flat_map(|(x, y)| img.get_pixel(x, y).0)
         .map(|v| v & 1)
         .chunks(8);
     let mut content = bytes.into_iter().map(|chunk| {
         chunk
-            .zip((0..8).rev())
+            .zip((0_u8..8).rev())
             .map(|(bit, shift)| bit << shift)
-            .sum()
+            .sum::<u8>()
     });
     let meta = Meta::read(&mut content).ok();
     println!("Image file: {filename}");
-    println!("Dimensions: {w}x{h}");
-    println!("Maximum embeddable file size: {max_cargo_size}");
-    match meta {
-        None => println!("No embedded data detected or metadata is missing."),
-        Some(ref v) => {
-            println!("Metadata version: {}", v.version);
-            let cargo_filename = v.filename().unwrap_or("<unnamed>");
-            let cargo_size = v
-                .size()
-                .map(format_size)
-                .unwrap_or_else(|| "<unknown>".to_string());
-            println!("Embedded file name: {cargo_filename}");
-            println!("Embedded file size: {cargo_size}");
-            if let Some(hash) = v.hash() {
-                println!("Embedded file CRC32: {hash:08x}");
-            }
-            if let Some(meta_hash) = v.meta_hash() {
-                println!("Header CRC32: {meta_hash:08x}");
-            }
-            if let Some(expected_hash) = v.hash() {
-                let read_size = v.size().unwrap_or(u32::MAX) as usize;
-                let mut crc = crc32fast::Hasher::new();
-                let mut remaining = read_size;
-                let mut chunk = [0u8; 8192];
-                while remaining > 0 {
-                    let to_read = chunk.len().min(remaining);
-                    let mut filled = 0;
-                    while filled < to_read {
-                        match content.next() {
-                            Some(b) => {
-                                chunk[filled] = b;
-                                filled += 1;
-                            }
-                            None => break,
-                        }
-                    }
-                    if filled == 0 {
-                        break;
-                    }
-                    crc.update(&chunk[..filled]);
-                    remaining -= filled;
-                }
-                let calculated = crc.finalize();
-                if calculated == expected_hash {
-                    println!("Payload CRC32: ok");
-                } else {
-                    println!("Payload CRC32: mismatch");
-                }
-            }
-        }
-    }
+    println!("Dimensions: {width}x{height}");
+    println!("Maximum embeddable file size: {max_payload_size}");
+    let Some(meta) = meta.as_ref() else {
+        println!("No embedded data detected or metadata is missing.");
+        return Ok(());
+    };
+    print_meta(meta, &mut content);
     Ok(())
 }
 
+fn print_meta<I: Iterator<Item = u8>>(meta: &Meta, content: &mut I) {
+    println!("Metadata version: {}", meta.version);
+    let payload_filename = meta.filename().unwrap_or("<unnamed>");
+    let payload_size = meta
+        .size()
+        .map_or_else(|| "<unknown>".to_string(), format_size);
+    println!("Embedded file name: {payload_filename}");
+    println!("Embedded file size: {payload_size}");
+    if let Some(hash) = meta.hash() {
+        println!("Embedded file CRC32: {hash:08x}");
+    }
+    if let Some(meta_hash) = meta.meta_hash() {
+        println!("Header CRC32: {meta_hash:08x}");
+    }
+    let Some(expected_hash) = meta.hash() else {
+        return;
+    };
+    let read_size = usize::try_from(meta.size().unwrap_or(u32::MAX)).unwrap_or(usize::MAX);
+    let mut crc = crc32fast::Hasher::new();
+    let mut remaining = read_size;
+    let mut buffer = [0_u8; READ_BUFFER_SIZE];
+    while remaining > 0 {
+        let to_read = buffer.len().min(remaining);
+        let Some(slice) = buffer.get_mut(..to_read) else {
+            break;
+        };
+        let mut filled: usize = 0;
+        for slot in slice.iter_mut() {
+            match content.next() {
+                Some(b) => {
+                    *slot = b;
+                    filled = filled.saturating_add(1);
+                }
+                None => break,
+            }
+        }
+        if filled == 0 {
+            break;
+        }
+        let Some(written) = buffer.get(..filled) else {
+            break;
+        };
+        crc.update(written);
+        remaining = remaining.saturating_sub(filled);
+    }
+    let calculated = crc.finalize();
+    if calculated == expected_hash {
+        println!("Payload CRC32: ok");
+    } else {
+        println!("Payload CRC32: mismatch");
+    }
+}
+
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::display_path;
     use std::path::Path;

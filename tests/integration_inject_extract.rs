@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)]
+
 use assert_cmd::Command;
 use image::open;
 use image::ImageBuffer;
@@ -43,12 +45,15 @@ fn flip_lsb_at_meta_byte(png: &Path, meta_byte: usize) {
     // iter_dots iterates (0..w).cartesian_product(0..h) → x outer, y inner.
     // Each metadata byte contributes 8 bits to 8 consecutive channels (RGBA).
     // We flip the LSB of the first bit of the target meta byte.
-    let bit_index = meta_byte * 8;
-    let pixel_index = bit_index / 4;
-    let channel_in_pixel = bit_index % 4;
-    let x = pixel_index as u32 / h;
-    let y = pixel_index as u32 % h;
-    img.get_pixel_mut(x, y).0[channel_in_pixel] ^= 1;
+    let bit_index = meta_byte.checked_mul(8).unwrap();
+    let pixel_index = bit_index.checked_div(4).unwrap();
+    let channel_in_pixel = bit_index.checked_rem(4).unwrap();
+    let pixel_index_u32 = u32::try_from(pixel_index).unwrap();
+    let x = pixel_index_u32.checked_div(h).unwrap();
+    let y = pixel_index_u32.checked_rem(h).unwrap();
+    let pixel = img.get_pixel_mut(x, y);
+    let channel = pixel.0.get_mut(channel_in_pixel).unwrap();
+    *channel ^= 1;
     img.save(png).unwrap();
 }
 
@@ -83,7 +88,7 @@ fn assert_extract_fails_with_error(png_path: &Path, extracted_path: &Path, expec
 }
 
 fn inject_file_into_png(
-    cargo: &Path,
+    payload: &Path,
     container: &Path,
     out_png: &Path,
     write_meta: bool,
@@ -92,7 +97,7 @@ fn inject_file_into_png(
     let mut cmd = Command::cargo_bin("injet").unwrap();
     cmd.args([
         "inject",
-        cargo.to_str().unwrap(),
+        payload.to_str().unwrap(),
         container.to_str().unwrap(),
         "-d",
         out_png.to_str().unwrap(),
@@ -170,10 +175,12 @@ fn inject_fails_on_size_limits(#[case] payload_size: usize) {
         .stderr(predicate::str::contains("exceeds container capacity"));
 }
 
+type CorruptFn = fn(&Path, &Path);
+
 #[rstest]
-#[case(corrupt_metadata_bit as fn(&Path, &Path), "Invalid metadata signature")]
-#[case(corrupt_payload_bit as fn(&Path, &Path), "Failed to verify hash")]
-fn extract_fails_on_corruption(#[case] corrupt_fn: fn(&Path, &Path), #[case] expected_error: &str) {
+#[case::meta(corrupt_metadata_bit, "Invalid metadata signature")]
+#[case::payload(corrupt_payload_bit, "Failed to verify hash")]
+fn extract_fails_on_corruption(#[case] corrupt_fn: CorruptFn, #[case] expected_error: &str) {
     let env = setup_env();
     inject_file_into_png(&env.bin_path, &env.png_path, &env.out_png_path, true, None);
     let corrupted_png_path = env.dir.path().join("corrupted_param.png");
@@ -229,13 +236,13 @@ fn extract_with_wrong_or_missing_seed_fails(#[case] use_wrong_seed: bool) {
     );
 }
 
-/// Layout for v3 meta with default fixture filename "payload.bin" (11 bytes):
-///   sig:        2 bytes  → offsets 0..2
-///   Size TLV:   6 bytes  → offsets 2..8   (value at 4..8)
-///   Filename:   13 bytes → offsets 8..21  (value at 10..21)
-///   Hash TLV:   6 bytes  → offsets 21..27
-///   MetaHash:   6 bytes  → offsets 27..33
-///   end:        2 bytes  → offsets 33..35
+/// Layout for v3 meta with default fixture filename `payload.bin` (11 bytes):
+///   `sig`:        2 bytes  → offsets 0..2
+///   `Size` TLV:   6 bytes  → offsets 2..8   (value at 4..8)
+///   `Filename`:   13 bytes → offsets 8..21  (value at 10..21)
+///   `Hash` TLV:   6 bytes  → offsets 21..27
+///   `MetaHash`:   6 bytes  → offsets 27..33
+///   `end`:        2 bytes  → offsets 33..35
 const META_OFFSET_INSIDE_SIZE: usize = 5;
 const META_OFFSET_INSIDE_FILENAME: usize = 14;
 
@@ -279,13 +286,13 @@ fn inject_accepts_filename_of_exactly_255_bytes() {
     let stem: String = "a".repeat(251);
     let filename = format!("{stem}.bin");
     assert_eq!(filename.len(), 255);
-    let cargo_path = env.dir.path().join(&filename);
-    std::fs::write(&cargo_path, b"hello").unwrap();
+    let payload_path = env.dir.path().join(&filename);
+    std::fs::write(&payload_path, b"hello").unwrap();
 
     let mut cmd = Command::cargo_bin("injet").unwrap();
     cmd.args([
         "inject",
-        cargo_path.to_str().unwrap(),
+        payload_path.to_str().unwrap(),
         env.png_path.to_str().unwrap(),
         "-d",
         env.out_png_path.to_str().unwrap(),
@@ -313,7 +320,13 @@ fn inject_accepts_filename_of_exactly_255_bytes() {
 #[case::meta_no_size_none(false, None)]
 fn extract_read_mode_combinations(#[case] write_meta: bool, #[case] read_size: Option<usize>) {
     let env = setup_env();
-    inject_file_into_png(&env.bin_path, &env.png_path, &env.out_png_path, write_meta, None);
+    inject_file_into_png(
+        &env.bin_path,
+        &env.png_path,
+        &env.out_png_path,
+        write_meta,
+        None,
+    );
     let bytes = extract_file_from_png(
         &env.out_png_path,
         &env.extracted_bin_path,
@@ -326,7 +339,11 @@ fn extract_read_mode_combinations(#[case] write_meta: bool, #[case] read_size: O
     // For the meta_no_size_none case, extract reads to EOF and may include extra bytes
     // beyond the payload. Truncate before comparing.
     let truncated_to = read_size.unwrap_or(TEST_PAYLOAD.len()).min(bytes.len());
-    assert_eq!(&bytes[..truncated_to], &TEST_PAYLOAD[..truncated_to.min(TEST_PAYLOAD.len())]);
+    let payload_slice = TEST_PAYLOAD
+        .get(..truncated_to.min(TEST_PAYLOAD.len()))
+        .unwrap();
+    let bytes_slice = bytes.get(..truncated_to).unwrap();
+    assert_eq!(bytes_slice, payload_slice);
 }
 
 #[rstest]
@@ -374,7 +391,7 @@ fn extract_to_stdout_when_piped() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert_eq!(&out.stdout[..TEST_PAYLOAD.len()], TEST_PAYLOAD);
+    assert_eq!(out.stdout.get(..TEST_PAYLOAD.len()).unwrap(), TEST_PAYLOAD);
 }
 
 #[test]
