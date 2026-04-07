@@ -301,3 +301,25 @@ fn inject_accepts_filename_of_exactly_255_bytes() {
 
     assert_eq!(std::fs::read(&restored).unwrap(), b"hello");
 }
+
+#[rstest]
+#[case::meta_yes_size_none(true, None)]
+#[case::meta_no_size_some(false, Some(2048))]
+#[case::meta_no_size_none(false, None)]
+fn extract_read_mode_combinations(#[case] write_meta: bool, #[case] read_size: Option<usize>) {
+    let env = setup_env();
+    inject_file_into_png(&env.bin_path, &env.png_path, &env.out_png_path, write_meta, None);
+    let bytes = extract_file_from_png(
+        &env.out_png_path,
+        &env.extracted_bin_path,
+        write_meta,
+        read_size,
+        None,
+        true,
+    )
+    .unwrap();
+    // For the meta_no_size_none case, extract reads to EOF and may include extra bytes
+    // beyond the payload. Truncate before comparing.
+    let truncated_to = read_size.unwrap_or(TEST_PAYLOAD.len()).min(bytes.len());
+    assert_eq!(&bytes[..truncated_to], &TEST_PAYLOAD[..truncated_to.min(TEST_PAYLOAD.len())]);
+}
