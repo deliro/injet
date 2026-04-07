@@ -5,117 +5,16 @@ use std::io::{stdout, BufReader, BufWriter, IsTerminal, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::process::exit;
 
-use clap::{arg, Args, Parser, Subcommand, ValueEnum};
-use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+use clap::Parser;
+use image::codecs::png::{FilterType, PngEncoder};
 use image::{ColorType, EncodableLayout, GenericImageView, ImageEncoder};
 use itertools::Itertools;
 use thiserror::Error;
 
-use injet::lsb::{gen_dots, to_bits, Seed};
+use injet::cli::{Cli, Commands, ExtractArgs, InjectArgs, InspectArgs};
+use injet::lsb::{gen_dots, to_bits};
 use injet::meta::Meta;
 
-#[derive(Parser)]
-#[command(author, version, about, long_about)]
-struct Cli {
-    #[command(subcommand)]
-    command: Commands,
-}
-
-#[derive(Subcommand)]
-enum Commands {
-    /// Injects a file into an image. If the image is not PNG/RGBA8, it will be converted
-    Inject(InjectArgs),
-
-    /// Extracts a file from an image
-    Extract(ExtractArgs),
-
-    /// Inspects an image if it has a file inside and prints the results.
-    /// Also tells how large a file can be injected inside
-    Inspect(InspectArgs),
-}
-
-#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
-enum Compression {
-    Default,
-    Fast,
-    Best,
-}
-
-impl From<Compression> for CompressionType {
-    fn from(val: Compression) -> Self {
-        match val {
-            Compression::Default => CompressionType::Default,
-            Compression::Fast => CompressionType::Fast,
-            Compression::Best => CompressionType::Best,
-        }
-    }
-}
-
-#[derive(Args)]
-struct InjectArgs {
-    /// The file to inject
-    cargo: PathBuf,
-
-    /// The image (container)
-    container: PathBuf,
-
-    /// Destination, where the injected file is placed
-    #[arg(short, long)]
-    destination: Option<PathBuf>,
-
-    /// Whether to write metadata. If not set, extracting would require --read-meta=false
-    /// and the exact file size in bytes (--read-size)
-    #[arg(short, long, default_value_t = true, action = clap::ArgAction::Set)]
-    write_meta: bool,
-
-    /// Compression level used to compress PNG
-    #[arg(value_enum, long, default_value_t = Compression::Default)]
-    compression: Compression,
-
-    /// Use seed to place bits in pseudorandom pixel positions.
-    /// The same seed must be provided during extraction or inspection
-    /// to correctly recover the data.
-    #[arg(long)]
-    seed: Option<Seed>,
-}
-
-#[derive(Args)]
-struct ExtractArgs {
-    /// Container that contains a file
-    container: PathBuf,
-
-    /// Where to save the extracted file. If not set, the filename will be read
-    /// from metadata (if any). If none are set, defaults to "cargo"
-    #[arg(short, long)]
-    destination: Option<PathBuf>,
-
-    /// Whether to read metadata. If metadata was not written and --read-meta=true,
-    /// extraction will fail. If metadata was written and --read-meta=false,
-    /// the extracted file will be broken
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    read_meta: bool,
-
-    /// How many bytes of the cargo file to read. Defaults to the value in metadata.
-    /// If none, defaults to the maximum (until the container ends)
-    #[arg(long)]
-    read_size: Option<u32>,
-
-    /// Seed used to pseudorandomly locate embedded data.
-    /// Must match the seed used during injection, if any.
-    #[arg(long)]
-    seed: Option<Seed>,
-}
-
-#[derive(Args)]
-struct InspectArgs {
-    /// Container file
-    path: PathBuf,
-
-    /// Seed used to pseudorandomly locate embedded data.
-    /// Must match the seed used during injection, if any.
-    #[arg(long)]
-    seed: Option<Seed>,
-}
 
 const KB: u32 = 1024;
 const MB: u32 = 1024 * 1024;
