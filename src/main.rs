@@ -252,23 +252,13 @@ impl MetaField {
             Ok(t) => t,
             Err(_) => return Ok(MetaFieldParseResult::Skip),
         };
-        let field: Option<MetaField> = match tag {
-            MetaTag::Size if bytes.len() == 4 => Some(MetaField::Size(u32::from_le_bytes(
-                bytes.try_into().expect("checked length == 4"),
-            ))),
-            MetaTag::Filename => Some(MetaField::Filename(parse_filename(bytes)?)),
-            MetaTag::Hash if bytes.len() == 4 => Some(MetaField::Hash(u32::from_le_bytes(
-                bytes.try_into().expect("checked length == 4"),
-            ))),
-            MetaTag::MetaHash if bytes.len() == 4 => Some(MetaField::MetaHash(
-                u32::from_le_bytes(bytes.try_into().expect("checked length == 4")),
-            )),
-            _ => None,
+        let field = match tag {
+            MetaTag::Size => MetaField::Size(parse_u32_field(bytes)?),
+            MetaTag::Filename => MetaField::Filename(parse_filename(bytes)?),
+            MetaTag::Hash => MetaField::Hash(parse_u32_field(bytes)?),
+            MetaTag::MetaHash => MetaField::MetaHash(parse_u32_field(bytes)?),
         };
-        Ok(match field {
-            Some(f) => MetaFieldParseResult::Field(f),
-            None => MetaFieldParseResult::Skip,
-        })
+        Ok(MetaFieldParseResult::Field(field))
     }
     pub fn as_size(&self) -> Option<u32> {
         if let MetaField::Size(sz) = self {
@@ -324,6 +314,14 @@ impl MetaField {
 
 fn parse_filename(bytes: Vec<u8>) -> Result<String, MetaError> {
     String::from_utf8(bytes).map_err(|_| MetaError::MalformedFilename)
+}
+
+fn parse_u32_field(bytes: Vec<u8>) -> Result<u32, MetaError> {
+    let array: [u8; 4] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| MetaError::MalformedField)?;
+    Ok(u32::from_le_bytes(array))
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -546,6 +544,8 @@ pub enum MetaError {
     HeaderHashMismatch,
     #[error("Metadata header hash field missing")]
     MetaHashMissing,
+    #[error("Malformed metadata field")]
+    MalformedField,
 }
 
 #[derive(Debug, Error)]
@@ -1104,5 +1104,21 @@ mod tests {
         let mut iter = bytes.into_iter();
         let err = Meta::read(&mut iter).expect_err("must reject non-UTF-8 filename");
         assert!(matches!(err, MetaError::MalformedFilename));
+    }
+
+    #[test]
+    fn test_meta_v2_rejects_size_field_with_wrong_length() {
+        use crate::{MAGIC, MetaError, VERSION_2};
+        let mut bytes = Vec::new();
+        let signature = (MAGIC << 3) | (VERSION_2 as u16);
+        bytes.extend(signature.to_le_bytes());
+        bytes.push(1); // Size tag
+        bytes.push(3); // wrong: should be 4
+        bytes.extend(&[0, 0, 0]);
+        bytes.push(0);
+        bytes.push(0);
+        let mut iter = bytes.into_iter();
+        let err = Meta::read(&mut iter).expect_err("malformed Size must error");
+        assert!(matches!(err, MetaError::MalformedField), "got {err:?}");
     }
 }
