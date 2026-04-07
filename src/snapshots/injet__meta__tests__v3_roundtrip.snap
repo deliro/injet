@@ -1,0 +1,23 @@
+---
+source: src/meta.rs
+expression: "Meta::read(&mut iter)"
+---
+Ok(
+    Meta {
+        version: 3,
+        fields: [
+            Size(
+                4242,
+            ),
+            Filename(
+                "hello.bin",
+            ),
+            Hash(
+                3735928559,
+            ),
+            MetaHash(
+                1125798964,
+            ),
+        ],
+    },
+)

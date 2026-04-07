@@ -1,0 +1,17 @@
+---
+source: src/meta.rs
+expression: "Meta::read(&mut iter)"
+---
+Ok(
+    Meta {
+        version: 2,
+        fields: [
+            Size(
+                1234,
+            ),
+            Filename(
+                "x.zip",
+            ),
+        ],
+    },
+)
