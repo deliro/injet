@@ -37,6 +37,21 @@ fn setup_env() -> TestEnv {
     }
 }
 
+fn flip_lsb_at_meta_byte(png: &Path, meta_byte: usize) {
+    let mut img = open(png).unwrap().into_rgba8();
+    let (_w, h) = img.dimensions();
+    // iter_dots iterates (0..w).cartesian_product(0..h) → x outer, y inner.
+    // Each metadata byte contributes 8 bits to 8 consecutive channels (RGBA).
+    // We flip the LSB of the first bit of the target meta byte.
+    let bit_index = meta_byte * 8;
+    let pixel_index = bit_index / 4;
+    let channel_in_pixel = bit_index % 4;
+    let x = pixel_index as u32 / h;
+    let y = pixel_index as u32 % h;
+    img.get_pixel_mut(x, y).0[channel_in_pixel] ^= 1;
+    img.save(png).unwrap();
+}
+
 fn corrupt_metadata_bit(src_png: &Path, dst_png: &Path) {
     let mut img = open(src_png).unwrap().into_rgba8();
     img.get_pixel_mut(0, 0).0[0] ^= 1;
@@ -207,6 +222,36 @@ fn extract_with_wrong_or_missing_seed_fails(#[case] use_wrong_seed: bool) {
         wrong_seed,
         false,
     );
+}
+
+/// Layout for v3 meta with default fixture filename "payload.bin" (11 bytes):
+///   sig:        2 bytes  → offsets 0..2
+///   Size TLV:   6 bytes  → offsets 2..8   (value at 4..8)
+///   Filename:   13 bytes → offsets 8..21  (value at 10..21)
+///   Hash TLV:   6 bytes  → offsets 21..27
+///   MetaHash:   6 bytes  → offsets 27..33
+///   end:        2 bytes  → offsets 33..35
+const META_OFFSET_INSIDE_SIZE: usize = 5;
+const META_OFFSET_INSIDE_FILENAME: usize = 14;
+
+#[rstest]
+#[case::size_field(META_OFFSET_INSIDE_SIZE)]
+#[case::filename_field(META_OFFSET_INSIDE_FILENAME)]
+fn extract_detects_header_corruption(#[case] meta_byte_offset: usize) {
+    let env = setup_env();
+    inject_file_into_png(&env.bin_path, &env.png_path, &env.out_png_path, true, None);
+    flip_lsb_at_meta_byte(&env.out_png_path, meta_byte_offset);
+
+    let mut cmd = Command::cargo_bin("injet").unwrap();
+    cmd.args([
+        "extract",
+        env.out_png_path.to_str().unwrap(),
+        "-d",
+        env.extracted_bin_path.to_str().unwrap(),
+    ]);
+    cmd.assert()
+        .failure()
+        .stderr(predicate::str::contains("Metadata header CRC mismatch"));
 }
 
 #[test]
