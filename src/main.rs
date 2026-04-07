@@ -7,7 +7,7 @@ use std::process::exit;
 
 use clap::{arg, Args, Parser, Subcommand, ValueEnum};
 use image::codecs::png::{CompressionType, FilterType, PngEncoder};
-use image::{ColorType, EncodableLayout, GenericImageView, ImageEncoder, Rgba};
+use image::{ColorType, EncodableLayout, GenericImageView, ImageEncoder};
 use itertools::Itertools;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
@@ -924,17 +924,16 @@ fn inject(args: InjectArgs) -> Result<(), InjectError> {
         if changed >= total_bits {
             break;
         }
-        let mut px = img.get_pixel(x, y).0;
-        for channel in &mut px {
+        let px = img.get_pixel_mut(x, y);
+        for channel in &mut px.0 {
             if changed >= total_bits {
                 break;
             }
             if let Some(bit) = bit_iter.next() {
-                *channel = (*channel & 0b11111110) | bit;
+                *channel = (*channel & 0b1111_1110) | bit;
                 changed += 1;
             }
         }
-        img.put_pixel(x, y, Rgba(px));
     }
     let writer = make_writer(args.destination.as_deref(), "modified.png")
         .map_err(InjectError::CannotSave)?;
