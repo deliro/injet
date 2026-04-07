@@ -9,8 +9,6 @@ use clap::{arg, Args, Parser, Subcommand, ValueEnum};
 use image::codecs::png::{CompressionType, FilterType, PngEncoder};
 use image::{ColorType, EncodableLayout, GenericImageView, ImageEncoder};
 use itertools::Itertools;
-use rand::seq::SliceRandom;
-use rand::SeedableRng;
 use thiserror::Error;
 
 const MAGIC: u16 = 0xd2d;
@@ -170,10 +168,51 @@ fn seed_to_array(seed: &str) -> [u8; 32] {
 }
 
 fn pseudo_shuffle_coords(w: u32, h: u32, seed: &Seed) -> impl Iterator<Item = (u32, u32)> {
-    let mut coords: Vec<(u32, u32)> = iter_dots(w, h).collect();
-    let mut rng = rand::rngs::StdRng::from_seed(seed_to_array(seed));
-    coords.shuffle(&mut rng);
-    coords.into_iter()
+    let n = u64::from(w) * u64::from(h);
+    // Round total bits up to an even number so Feistel halves are symmetric.
+    let bits_min = if n <= 1 { 2 } else { 64 - (n - 1).leading_zeros() };
+    let bits_even = if bits_min % 2 == 0 {
+        bits_min
+    } else {
+        bits_min + 1
+    };
+    let bits = bits_even.max(2);
+    let half = bits / 2;
+    let mask = if half >= 64 { u64::MAX } else { (1u64 << half) - 1 };
+    let total = if bits >= 64 { u64::MAX } else { 1u64 << bits };
+    let key = seed_to_array(seed);
+
+    let round_fn = move |x: u64, r: u32| -> u64 {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&key);
+        hasher.update(&[r as u8]);
+        hasher.update(&x.to_le_bytes());
+        let bytes = hasher.finalize();
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&bytes.as_bytes()[..8]);
+        u64::from_le_bytes(buf) & mask
+    };
+
+    let feistel = move |x: u64| -> u64 {
+        let mut l = (x >> half) & mask;
+        let mut r = x & mask;
+        for round in 0..4u32 {
+            let new_l = r;
+            let new_r = l ^ round_fn(r, round);
+            l = new_l;
+            r = new_r;
+        }
+        (l << half) | r
+    };
+
+    (0..total)
+        .map(feistel)
+        .filter(move |v| *v < n)
+        .map(move |v| {
+            let x = (v / u64::from(h)) as u32;
+            let y = (v % u64::from(h)) as u32;
+            (x, y)
+        })
 }
 
 fn gen_dots(w: u32, h: u32, seed: Option<&Seed>) -> impl Iterator<Item = (u32, u32)> {
