@@ -353,3 +353,21 @@ fn round_trip_with_compression(#[case] level: &str) {
     .unwrap();
     assert_eq!(bytes, TEST_PAYLOAD);
 }
+
+#[test]
+fn extract_to_stdout_when_piped() {
+    let env = setup_env();
+    inject_file_into_png(&env.bin_path, &env.png_path, &env.out_png_path, true, None);
+    // assert_cmd captures stdout via Stdio::piped → make_writer's `is_terminal()` returns false → writes to stdout.
+    let out = Command::cargo_bin("injet")
+        .unwrap()
+        .args(["extract", env.out_png_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(&out.stdout[..TEST_PAYLOAD.len()], TEST_PAYLOAD);
+}
