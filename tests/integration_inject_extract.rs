@@ -60,7 +60,12 @@ fn corrupt_metadata_bit(src_png: &Path, dst_png: &Path) {
 
 fn corrupt_payload_bit(src_png: &Path, dst_png: &Path) {
     let mut img = open(src_png).unwrap().into_rgba8();
-    img.get_pixel_mut(32, 0).0[0] ^= 1;
+    // The v3 meta header for the default fixture is ~33 bytes = 264 bits =
+    // 66 channels = 16.5 pixels. Pixel (1, 0) sits at linear index 100
+    // (since iter_dots is x-outer, y-inner with h=100), bit index 400 — well
+    // past the meta region and well inside the 2 KB payload bit stream.
+    // The choice survives any reasonable v3 meta growth (up to ~50 pixels).
+    img.get_pixel_mut(1, 0).0[0] ^= 1;
     img.save(dst_png).unwrap();
 }
 
