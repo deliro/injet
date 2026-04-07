@@ -371,3 +371,34 @@ fn extract_to_stdout_when_piped() {
     );
     assert_eq!(&out.stdout[..TEST_PAYLOAD.len()], TEST_PAYLOAD);
 }
+
+#[test]
+fn inject_succeeds_at_exact_capacity_without_meta() {
+    let env = setup_env();
+    // 100x100 RGBA8 → 5000 bytes max payload, no meta.
+    let payload = vec![0xABu8; 5000];
+    let bin_path = env.dir.path().join("exact.bin");
+    std::fs::write(&bin_path, &payload).unwrap();
+    let mut cmd = Command::cargo_bin("injet").unwrap();
+    cmd.args([
+        "inject",
+        bin_path.to_str().unwrap(),
+        env.png_path.to_str().unwrap(),
+        "-d",
+        env.out_png_path.to_str().unwrap(),
+        "--write-meta",
+        "false",
+    ]);
+    cmd.assert().success();
+
+    let bytes = extract_file_from_png(
+        &env.out_png_path,
+        &env.extracted_bin_path,
+        false,
+        Some(5000),
+        None,
+        true,
+    )
+    .unwrap();
+    assert_eq!(bytes, payload);
+}
