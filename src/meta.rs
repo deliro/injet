@@ -414,162 +414,86 @@ pub enum MetaError {
 
 #[cfg(test)]
 mod tests {
-    use std::assert_eq;
+    use super::{Meta, MAGIC, VERSION_1, VERSION_2};
+    use rstest::rstest;
 
-    use super::{Meta, MetaError, MAGIC, VERSION_1, VERSION_2};
-
-    #[test]
-    fn test_meta_v2_roundtrip() {
-        let meta = Meta::make(Some(1231234), Some("hello.zip".to_string()), Some(u32::MAX));
-        let meta_bytes = meta.to_bytes();
-        println!("meta v2 bytes: {:02x?}", meta_bytes);
-        let mut bytes = meta_bytes.into_iter();
-        match Meta::read(&mut bytes) {
-            Err(_) => panic!("meta wasn't read (v2)"),
-            Ok(v) => assert_eq!(v, meta, "received meta differs (v2)"),
-        }
-        assert_eq!(bytes.next(), None);
-    }
-
-    #[test]
-    fn test_meta_v1_parsing() {
-        // Test version 1 (legacy): manual bytes, only parse
-        let mut v1_bytes = Vec::new();
+    fn build_v1_bytes() -> Vec<u8> {
+        let mut bytes = Vec::new();
         let signature = (MAGIC << 3) | (VERSION_1 as u16);
-        v1_bytes.extend(signature.to_le_bytes());
-        v1_bytes.extend(1231234u32.to_le_bytes());
+        bytes.extend(signature.to_le_bytes());
+        bytes.extend(1231234u32.to_le_bytes());
         let filename = b"hello.zip";
-        v1_bytes.push(filename.len() as u8);
-        v1_bytes.extend(filename);
-        let mut v1_iter = v1_bytes.into_iter();
-        let meta_v1 = Meta::read(&mut v1_iter).expect("meta v1 should parse");
-        assert_eq!(meta_v1.version, VERSION_1);
-        assert_eq!(
-            meta_v1.fields.iter().find_map(|f| f.as_size()).unwrap(),
-            1231234
-        );
-        assert_eq!(
-            meta_v1.fields.iter().find_map(|f| f.as_filename()).unwrap(),
-            "hello.zip"
-        );
-        assert_eq!(v1_iter.next(), None);
+        bytes.push(filename.len() as u8);
+        bytes.extend(filename);
+        bytes
     }
 
-    #[test]
-    fn test_meta_v2_skips_unknown_tlv_and_keeps_parsing() {
-        // Build a v2 meta byte stream:
-        //   signature(v2) | Size(4) | UnknownTag=0x7F len=5 + 5 bytes | Filename "x.zip" | end
+    fn build_v2_roundtrip() -> Vec<u8> {
+        Meta::make(Some(1231234), Some("hello.zip".into()), Some(u32::MAX)).to_bytes()
+    }
+
+    fn build_v2_unknown_tlv() -> Vec<u8> {
         let mut bytes = Vec::new();
         let signature = (MAGIC << 3) | (VERSION_2 as u16);
         bytes.extend(signature.to_le_bytes());
-
-        // Size = 1234
-        bytes.push(1); // tag Size
-        bytes.push(4); // len
+        bytes.push(1);
+        bytes.push(4);
         bytes.extend(1234u32.to_le_bytes());
-
-        // Unknown tag 0x7F with 5-byte payload
         bytes.push(0x7F);
         bytes.push(5);
         bytes.extend([0xAA, 0xBB, 0xCC, 0xDD, 0xEE]);
-
-        // Filename "x.zip"
-        bytes.push(2); // tag Filename
-        bytes.push(5); // len
+        bytes.push(2);
+        bytes.push(5);
         bytes.extend(b"x.zip");
-
-        // end marker
         bytes.push(0);
         bytes.push(0);
-
-        let mut iter = bytes.into_iter();
-        let meta = Meta::read(&mut iter).expect("meta should parse despite unknown tag");
-        assert_eq!(meta.size(), Some(1234), "Size field must survive unknown tag");
-        assert_eq!(
-            meta.filename(),
-            Some("x.zip"),
-            "Filename after unknown tag must still be parsed"
-        );
-        assert_eq!(iter.next(), None, "stream must be fully consumed");
+        bytes
     }
 
-    #[test]
-    fn test_meta_v3_roundtrip_with_header_hash() {
-        let meta = Meta::make_v3(
-            Some(4242),
-            Some("hello.bin".to_string()),
-            Some(0xDEADBEEF),
-        );
-        assert_eq!(meta.version, 3);
-        let bytes = meta.to_bytes();
-        // Compute the expected CRC directly: it covers everything from the start of `bytes`
-        // up to (but not including) the MetaHash TLV. The MetaHash TLV at the tail is
-        // 6 bytes (tag + len + 4-byte value), and is followed by the 2-byte end marker.
-        let meta_hash_tlv_len = 1 /* tag */ + 1 /* len */ + 4 /* u32 */;
-        let end_marker_len = 2;
-        let covered_end = bytes.len() - end_marker_len - meta_hash_tlv_len;
-        let expected_crc = crc32fast::hash(&bytes[..covered_end]);
-
-        let mut iter = bytes.into_iter();
-        let parsed = Meta::read(&mut iter).expect("v3 must parse");
-        assert_eq!(parsed.version, 3);
-        assert_eq!(parsed.size(), Some(4242));
-        assert_eq!(parsed.filename(), Some("hello.bin"));
-        assert_eq!(parsed.hash(), Some(0xDEADBEEF));
-        assert_eq!(
-            parsed.meta_hash(),
-            Some(expected_crc),
-            "MetaHash must equal CRC32 of the preceding header bytes"
-        );
-        assert_eq!(iter.next(), None);
+    fn build_v3_roundtrip() -> Vec<u8> {
+        Meta::make_v3(Some(4242), Some("hello.bin".into()), Some(0xDEADBEEF)).to_bytes()
     }
 
-    #[test]
-    fn test_meta_v3_header_hash_mismatch_detected() {
-        let meta = Meta::make_v3(Some(123), Some("a.bin".into()), Some(0));
-        let mut bytes = meta.to_bytes();
-        // Flip one bit somewhere inside the Filename field (which is BEFORE MetaHash).
-        // Layout for v3 with size=123, filename="a.bin" (5 bytes), hash=0:
-        //   sig:        2 bytes  (offsets 0..2)
-        //   Size TLV:   1+1+4 = 6 bytes  (offsets 2..8)
-        //   Filename:   1+1+5 = 7 bytes  (offsets 8..15) — value at 10..15
-        // Flip a bit inside the filename value.
+    fn build_v3_tampered() -> Vec<u8> {
+        let mut bytes = Meta::make_v3(Some(123), Some("a.bin".into()), Some(0)).to_bytes();
         bytes[12] ^= 0x01;
-        let mut iter = bytes.into_iter();
-        let err = Meta::read(&mut iter).expect_err("must detect header tampering");
-        assert!(
-            matches!(err, MetaError::HeaderHashMismatch),
-            "expected HeaderHashMismatch, got {err:?}"
-        );
+        bytes
     }
 
-    #[test]
-    fn test_meta_v2_rejects_non_utf8_filename() {
+    fn build_v2_bad_utf8() -> Vec<u8> {
         let mut bytes = Vec::new();
         let signature = (MAGIC << 3) | (VERSION_2 as u16);
         bytes.extend(signature.to_le_bytes());
-        bytes.push(2); // Filename tag
+        bytes.push(2);
         bytes.push(3);
-        bytes.extend(&[0xFF, 0xFE, 0xFD]); // not valid UTF-8
+        bytes.extend(&[0xFF, 0xFE, 0xFD]);
         bytes.push(0);
         bytes.push(0);
-        let mut iter = bytes.into_iter();
-        let err = Meta::read(&mut iter).expect_err("must reject non-UTF-8 filename");
-        assert!(matches!(err, MetaError::MalformedFilename));
+        bytes
     }
 
-    #[test]
-    fn test_meta_v2_rejects_size_field_with_wrong_length() {
+    fn build_v2_bad_size() -> Vec<u8> {
         let mut bytes = Vec::new();
         let signature = (MAGIC << 3) | (VERSION_2 as u16);
         bytes.extend(signature.to_le_bytes());
-        bytes.push(1); // Size tag
-        bytes.push(3); // wrong: should be 4
+        bytes.push(1);
+        bytes.push(3);
         bytes.extend(&[0, 0, 0]);
         bytes.push(0);
         bytes.push(0);
+        bytes
+    }
+
+    #[rstest]
+    #[case::v1("v1", build_v1_bytes())]
+    #[case::v2_roundtrip("v2_roundtrip", build_v2_roundtrip())]
+    #[case::v2_unknown_tlv("v2_unknown_tlv", build_v2_unknown_tlv())]
+    #[case::v3_roundtrip("v3_roundtrip", build_v3_roundtrip())]
+    #[case::v3_tampered("v3_tampered", build_v3_tampered())]
+    #[case::v2_bad_utf8("v2_bad_utf8", build_v2_bad_utf8())]
+    #[case::v2_bad_size("v2_bad_size", build_v2_bad_size())]
+    fn meta_parse(#[case] name: &str, #[case] bytes: Vec<u8>) {
         let mut iter = bytes.into_iter();
-        let err = Meta::read(&mut iter).expect_err("malformed Size must error");
-        assert!(matches!(err, MetaError::MalformedField), "got {err:?}");
+        insta::assert_debug_snapshot!(name, Meta::read(&mut iter));
     }
 }

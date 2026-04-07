@@ -1,0 +1,7 @@
+---
+source: src/meta.rs
+expression: "Meta::read(&mut iter)"
+---
+Err(
+    MalformedField,
+)
