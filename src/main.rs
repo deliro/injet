@@ -660,6 +660,9 @@ fn inspect(args: InspectArgs) -> Result<(), InspectError> {
             if let Some(hash) = v.hash() {
                 println!("Embedded file CRC32: {hash:08x}");
             }
+            if let Some(meta_hash) = v.meta_hash() {
+                println!("Header CRC32: {meta_hash:08x}");
+            }
         }
     }
     Ok(())
@@ -778,7 +781,7 @@ fn inject(args: InjectArgs) -> Result<(), InjectError> {
             hasher.update(&buf[..n]);
         }
         let hash = hasher.finalize();
-        let meta = Meta::make(Some(cargo_size), filename, Some(hash));
+        let meta = Meta::make_v3(Some(cargo_size), filename, Some(hash));
         meta_bits.extend(meta.to_bits());
     }
 
