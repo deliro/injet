@@ -19,35 +19,32 @@ fn to_bits(val: u8) -> [u8; 8] {
     ]
 }
 
-macro_rules! meta_tag_enum {
-    ($( $name:ident = $val:expr ),* $(,)?) => {
-        #[repr(u8)]
-        #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-        pub(crate) enum MetaTag {
-            $( $name = $val, )*
-        }
-        impl From<MetaTag> for u8 {
-            fn from(tag: MetaTag) -> Self {
-                tag as u8
-            }
-        }
-        impl std::convert::TryFrom<u8> for MetaTag {
-            type Error = ();
-            fn try_from(value: u8) -> Result<Self, Self::Error> {
-                match value {
-                    $( $val => Ok(MetaTag::$name), )*
-                    _ => Err(()),
-                }
-            }
-        }
-    };
-}
-
-meta_tag_enum! {
+#[repr(u8)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum MetaTag {
     Size = 1,
     Filename = 2,
     Hash = 3,
     MetaHash = 4,
+}
+
+impl From<MetaTag> for u8 {
+    fn from(tag: MetaTag) -> u8 {
+        tag as u8
+    }
+}
+
+impl TryFrom<u8> for MetaTag {
+    type Error = ();
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(MetaTag::Size),
+            2 => Ok(MetaTag::Filename),
+            3 => Ok(MetaTag::Hash),
+            4 => Ok(MetaTag::MetaHash),
+            _ => Err(()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
