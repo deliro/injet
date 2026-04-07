@@ -139,6 +139,12 @@ fn format_size(size: u32) -> String {
     }
 }
 
+fn display_path(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
+
 #[inline]
 fn to_bits(val: u8) -> [u8; 8] {
     [
@@ -482,7 +488,7 @@ fn inspect(args: InspectArgs) -> Result<(), InspectError> {
         return Err(InspectError::NotAFile);
     }
 
-    let filename = args.path.file_name().unwrap().to_string_lossy().to_string();
+    let filename = display_path(&args.path);
     let img = image::open(&args.path).map_err(|_| InspectError::NotAnImage)?;
     let (w, h) = img.dimensions();
     let max_cargo_size = format_size((w * h * 4) / 8);
@@ -774,5 +780,18 @@ mod tests {
             "Filename after unknown tag must still be parsed"
         );
         assert_eq!(iter.next(), None, "stream must be fully consumed");
+    }
+
+    #[test]
+    fn test_display_path_handles_dot_dot() {
+        use std::path::Path;
+        use crate::display_path;
+        // `..` has no file_name component — must not panic, must produce something printable.
+        let s = display_path(Path::new(".."));
+        assert!(!s.is_empty());
+
+        // A normal file_name path keeps the last component.
+        let s = display_path(Path::new("/tmp/hello.bin"));
+        assert_eq!(s, "hello.bin");
     }
 }
