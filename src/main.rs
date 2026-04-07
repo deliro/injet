@@ -415,6 +415,33 @@ impl Meta {
         }
     }
 
+    fn locate_meta_hash(body: &[u8]) -> Result<usize, MetaError> {
+        let mut offset = 2usize;
+        while offset < body.len() {
+            if offset + 1 >= body.len() {
+                return Err(MetaError::NoBytes);
+            }
+            let tag = body[offset];
+            let len_byte = body[offset + 1];
+            let (len_prefix_extra, value_len) = if len_byte == 0 {
+                if offset + 3 >= body.len() {
+                    return Err(MetaError::NoBytes);
+                }
+                (
+                    2usize,
+                    u16::from_le_bytes([body[offset + 2], body[offset + 3]]) as usize,
+                )
+            } else {
+                (0usize, len_byte as usize)
+            };
+            if tag == u8::from(MetaTag::MetaHash) {
+                return Ok(offset);
+            }
+            offset += 2 + len_prefix_extra + value_len;
+        }
+        Err(MetaError::HeaderHashMismatch)
+    }
+
     pub fn read<T>(value: &mut T) -> Result<Self, MetaError>
     where
         T: Iterator<Item = u8>,
@@ -446,9 +473,66 @@ impl Meta {
                 Ok(Meta { version, fields })
             }
             VERSION_3 => {
+                // Buffer signature + whole TLV stream until the 0x00 0x00 end marker.
+                // We cannot scan byte-by-byte for 0x00 0x00 because TLV values may
+                // legitimately contain zero bytes (e.g. `u32` payloads). Parse
+                // TLV-by-TLV instead: read tag, read length, then consume `len` bytes.
+                let mut body_buf: Vec<u8> = Vec::with_capacity(64);
+                body_buf.extend(sig_bytes.iter().copied());
+                loop {
+                    let tag = value.next().ok_or(MetaError::NoBytes)?;
+                    let len_byte = value.next().ok_or(MetaError::NoBytes)?;
+                    if tag == 0 && len_byte == 0 {
+                        // End marker — do NOT include in body (CRC covers only the
+                        // TLV-bearing prefix).
+                        break;
+                    }
+                    body_buf.push(tag);
+                    body_buf.push(len_byte);
+                    let value_len = if len_byte == 0 {
+                        let hi = value.next().ok_or(MetaError::NoBytes)?;
+                        let lo = value.next().ok_or(MetaError::NoBytes)?;
+                        body_buf.push(hi);
+                        body_buf.push(lo);
+                        u16::from_le_bytes([hi, lo]) as usize
+                    } else {
+                        len_byte as usize
+                    };
+                    for _ in 0..value_len {
+                        let b = value.next().ok_or(MetaError::NoBytes)?;
+                        body_buf.push(b);
+                    }
+                }
+                let body = body_buf.as_slice();
+
+                // Locate the MetaHash TLV by walking TLV records after the signature.
+                let meta_hash_offset = Self::locate_meta_hash(body)?;
+
+                // The CRC covers everything before the MetaHash TLV.
+                let covered = &body[..meta_hash_offset];
+                // The MetaHash value lives at offset + 2 (tag + len, len always 4 here).
+                if meta_hash_offset + 6 > body.len() {
+                    return Err(MetaError::NoBytes);
+                }
+                let expected_crc = u32::from_le_bytes([
+                    body[meta_hash_offset + 2],
+                    body[meta_hash_offset + 3],
+                    body[meta_hash_offset + 4],
+                    body[meta_hash_offset + 5],
+                ]);
+                if crc32fast::hash(covered) != expected_crc {
+                    return Err(MetaError::HeaderHashMismatch);
+                }
+
+                // Parse the verified body. Re-append the end marker so `from_tlv_field`
+                // sees the End sentinel where it expects it.
+                let mut parse_buf: Vec<u8> = body[2..].to_vec();
+                parse_buf.push(0);
+                parse_buf.push(0);
+                let mut iter = parse_buf.into_iter();
                 let mut fields = Vec::new();
                 loop {
-                    match MetaField::from_tlv_field(value)? {
+                    match MetaField::from_tlv_field(&mut iter)? {
                         MetaFieldParseResult::Field(field) => fields.push(field),
                         MetaFieldParseResult::End => break,
                         MetaFieldParseResult::Skip => continue,
@@ -484,6 +568,8 @@ pub enum MetaError {
     UnsupportedVersion(u8),
     #[error("Invalid or corrupted filename in metadata")]
     MalformedFilename,
+    #[error("Metadata header CRC mismatch")]
+    HeaderHashMismatch,
 }
 
 #[derive(Debug, Error)]
@@ -889,6 +975,26 @@ mod tests {
             "MetaHash must equal CRC32 of the preceding header bytes"
         );
         assert_eq!(iter.next(), None);
+    }
+
+    #[test]
+    fn test_meta_v3_header_hash_mismatch_detected() {
+        use crate::MetaError;
+        let meta = Meta::make_v3(Some(123), Some("a.bin".into()), Some(0));
+        let mut bytes = meta.to_bytes();
+        // Flip one bit somewhere inside the Filename field (which is BEFORE MetaHash).
+        // Layout for v3 with size=123, filename="a.bin" (5 bytes), hash=0:
+        //   sig:        2 bytes  (offsets 0..2)
+        //   Size TLV:   1+1+4 = 6 bytes  (offsets 2..8)
+        //   Filename:   1+1+5 = 7 bytes  (offsets 8..15) — value at 10..15
+        // Flip a bit inside the filename value.
+        bytes[12] ^= 0x01;
+        let mut iter = bytes.into_iter();
+        let err = Meta::read(&mut iter).expect_err("must detect header tampering");
+        assert!(
+            matches!(err, MetaError::HeaderHashMismatch),
+            "expected HeaderHashMismatch, got {err:?}"
+        );
     }
 
     #[test]
