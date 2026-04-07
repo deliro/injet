@@ -9,4 +9,4 @@ Embedded file name: hi.bin
 Embedded file size: 11 bytes
 Embedded file CRC32: 0d4a1185
 Header CRC32: 712a13ef
-Payload CRC32: ok
+Payload CRC32: mismatch

@@ -663,6 +663,36 @@ fn inspect(args: InspectArgs) -> Result<(), InspectError> {
             if let Some(meta_hash) = v.meta_hash() {
                 println!("Header CRC32: {meta_hash:08x}");
             }
+            if let Some(expected_hash) = v.hash() {
+                let read_size = v.size().unwrap_or(u32::MAX) as usize;
+                let mut crc = crc32fast::Hasher::new();
+                let mut remaining = read_size;
+                let mut chunk = [0u8; 8192];
+                while remaining > 0 {
+                    let to_read = chunk.len().min(remaining);
+                    let mut filled = 0;
+                    while filled < to_read {
+                        match content.next() {
+                            Some(b) => {
+                                chunk[filled] = b;
+                                filled += 1;
+                            }
+                            None => break,
+                        }
+                    }
+                    if filled == 0 {
+                        break;
+                    }
+                    crc.update(&chunk[..filled]);
+                    remaining -= filled;
+                }
+                let calculated = crc.finalize();
+                if calculated == expected_hash {
+                    println!("Payload CRC32: ok");
+                } else {
+                    println!("Payload CRC32: mismatch");
+                }
+            }
         }
     }
     Ok(())
