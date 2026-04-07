@@ -323,3 +323,33 @@ fn extract_read_mode_combinations(#[case] write_meta: bool, #[case] read_size: O
     let truncated_to = read_size.unwrap_or(TEST_PAYLOAD.len()).min(bytes.len());
     assert_eq!(&bytes[..truncated_to], &TEST_PAYLOAD[..truncated_to.min(TEST_PAYLOAD.len())]);
 }
+
+#[rstest]
+#[case("default")]
+#[case("fast")]
+#[case("best")]
+fn round_trip_with_compression(#[case] level: &str) {
+    let env = setup_env();
+    let mut cmd = Command::cargo_bin("injet").unwrap();
+    cmd.args([
+        "inject",
+        env.bin_path.to_str().unwrap(),
+        env.png_path.to_str().unwrap(),
+        "-d",
+        env.out_png_path.to_str().unwrap(),
+        "--compression",
+        level,
+    ]);
+    cmd.assert().success();
+
+    let bytes = extract_file_from_png(
+        &env.out_png_path,
+        &env.extracted_bin_path,
+        true,
+        Some(TEST_PAYLOAD.len()),
+        None,
+        true,
+    )
+    .unwrap();
+    assert_eq!(bytes, TEST_PAYLOAD);
+}
