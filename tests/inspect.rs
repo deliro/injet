@@ -23,6 +23,7 @@ fn run_inspect(args: &[&str]) -> String {
 #[case::empty_png("empty")]
 #[case::with_meta("with_meta")]
 #[case::with_seed("with_seed")]
+#[case::corrupted_payload("corrupted_payload")]
 fn inspect_output(#[case] case: &str) {
     let dir = tempdir().unwrap();
     let png: PathBuf = dir.path().join("c.png");
@@ -50,6 +51,12 @@ fn inspect_output(#[case] case: &str) {
             .args(&inj_refs)
             .assert()
             .success();
+    }
+
+    if case == "corrupted_payload" {
+        let mut img = image::open(&png).unwrap().into_rgba8();
+        img.get_pixel_mut(0, 70).0[0] ^= 1;
+        img.save(&png).unwrap();
     }
 
     let mut args: Vec<String> = vec!["inspect".into(), png.to_string_lossy().into_owned()];
