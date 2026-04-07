@@ -252,13 +252,11 @@ impl MetaField {
             Ok(t) => t,
             Err(_) => return Ok(MetaFieldParseResult::Skip),
         };
-        let field = match tag {
+        let field: Option<MetaField> = match tag {
             MetaTag::Size if bytes.len() == 4 => Some(MetaField::Size(u32::from_le_bytes(
                 bytes.try_into().expect("checked length == 4"),
             ))),
-            MetaTag::Filename => Some(MetaField::Filename(
-                String::from_utf8_lossy(&bytes).to_string(),
-            )),
+            MetaTag::Filename => Some(MetaField::Filename(parse_filename(bytes)?)),
             MetaTag::Hash if bytes.len() == 4 => Some(MetaField::Hash(u32::from_le_bytes(
                 bytes.try_into().expect("checked length == 4"),
             ))),
@@ -318,11 +316,14 @@ impl MetaField {
             if filename_vec.len() as u8 != sz {
                 return Err(MetaError::MalformedFilename);
             }
-            let filename_lossy = String::from_utf8_lossy(&filename_vec);
-            fields.push(MetaField::Filename(filename_lossy.to_string()));
+            fields.push(MetaField::Filename(parse_filename(filename_vec)?));
         }
         Ok(fields)
     }
+}
+
+fn parse_filename(bytes: Vec<u8>) -> Result<String, MetaError> {
+    String::from_utf8(bytes).map_err(|_| MetaError::MalformedFilename)
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -1001,5 +1002,21 @@ mod tests {
         sorted.sort();
         sorted.dedup();
         assert_eq!(sorted.len(), 400);
+    }
+
+    #[test]
+    fn test_meta_v2_rejects_non_utf8_filename() {
+        use crate::{MAGIC, MetaError, VERSION_2};
+        let mut bytes = Vec::new();
+        let signature = (MAGIC << 3) | (VERSION_2 as u16);
+        bytes.extend(signature.to_le_bytes());
+        bytes.push(2); // Filename tag
+        bytes.push(3);
+        bytes.extend(&[0xFF, 0xFE, 0xFD]); // not valid UTF-8
+        bytes.push(0);
+        bytes.push(0);
+        let mut iter = bytes.into_iter();
+        let err = Meta::read(&mut iter).expect_err("must reject non-UTF-8 filename");
+        assert!(matches!(err, MetaError::MalformedFilename));
     }
 }
