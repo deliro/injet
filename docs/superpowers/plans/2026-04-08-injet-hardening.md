@@ -667,58 +667,72 @@ In `Meta::read`, when the version is `VERSION_3`:
 3. Loop reading TLV fields. When a `MetaHash` field is encountered: stop capturing **before** reading its tag byte. This means: read fields one by one, but for each field, peek ahead at the next byte before passing it to `from_tlv_field`. If it is the `MetaHash` tag, set `capture = false`, then call `from_tlv_field`.
 4. After the loop, compute `crc32fast::hash(&header_bytes)` and compare to the parsed `MetaHash` value.
 
-A cleaner alternative is to pre-buffer the entire header (signature + everything until end marker) into a `Vec<u8>`, then run two passes: one to locate the `MetaHash` field's bytes, one to verify and parse. Pseudocode:
+A cleaner alternative is to pre-buffer the header into a `Vec<u8>`, track the `MetaHash` TLV offset **during** the buffering pass (no re-scan), then verify the CRC and re-parse from the verified buffer.
+
+**WARNING — do NOT scan for `0x00 0x00` byte-by-byte.** TLV values legitimately
+contain zero bytes (e.g. `Size(4242)` serializes to `[0x92, 0x10, 0x00, 0x00]`),
+so a naive byte-scan terminates mid-TLV. Use a TLV-aware walk that reads
+`tag + len`, handles the extended-length escape (`len == 0` → read u16), and
+consumes exactly `value_len` bytes per record. Stop only when you see
+`tag == 0 && len == 0` at the start of a TLV record.
+
+Sketch — a single TLV-aware pass that both buffers bytes for CRC and records the `MetaHash` offset:
 
 ```rust
 VERSION_3 => {
-    // Buffer everything until end marker (0x00, 0x00).
-    let mut header = Vec::with_capacity(64);
-    header.extend(sig_bytes);
+    let mut body: Vec<u8> = Vec::with_capacity(64);
+    body.extend(sig_bytes.iter().copied());
+    let mut meta_hash_offset: Option<usize> = None;
     loop {
-        let b = value.next().ok_or(MetaError::NoBytes)?;
-        header.push(b);
-        if header.len() >= 4
-            && header[header.len() - 2] == 0
-            && header[header.len() - 1] == 0
-        {
+        let field_start = body.len();
+        let tag = value.next().ok_or(MetaError::NoBytes)?;
+        let len_byte = value.next().ok_or(MetaError::NoBytes)?;
+        if tag == 0 && len_byte == 0 {
+            // End marker — NOT pushed into `body` (CRC scope ends here).
             break;
         }
-    }
-    // Strip the end marker for CRC computation.
-    let body = &header[..header.len() - 2];
-
-    // Find MetaHash TLV: scan TLVs from offset 2 (after signature).
-    let mut offset = 2usize;
-    let mut meta_hash_pos: Option<usize> = None;
-    while offset < body.len() {
-        let tag = body[offset];
-        let len = body[offset + 1];
-        let (len_bytes, value_len) = if len == 0 {
-            let l = u16::from_le_bytes([body[offset + 2], body[offset + 3]]) as usize;
-            (2, l)
+        body.push(tag);
+        body.push(len_byte);
+        let value_len = if len_byte == 0 {
+            let lo = value.next().ok_or(MetaError::NoBytes)?;
+            let hi = value.next().ok_or(MetaError::NoBytes)?;
+            body.push(lo);
+            body.push(hi);
+            u16::from_le_bytes([lo, hi]) as usize
         } else {
-            (0, len as usize)
+            len_byte as usize
         };
-        if tag == u8::from(MetaTag::MetaHash) {
-            meta_hash_pos = Some(offset);
-            break;
+        for _ in 0..value_len {
+            let b = value.next().ok_or(MetaError::NoBytes)?;
+            body.push(b);
         }
-        offset += 2 + len_bytes + value_len;
+        if tag == u8::from(MetaTag::MetaHash) && meta_hash_offset.is_none() {
+            meta_hash_offset = Some(field_start);
+        }
     }
-    let meta_hash_pos = meta_hash_pos.ok_or(MetaError::HeaderHashMismatch)?;
-    let to_hash = &body[..meta_hash_pos];
-    let expected = u32::from_le_bytes([
-        body[meta_hash_pos + 2],
-        body[meta_hash_pos + 3],
-        body[meta_hash_pos + 4],
-        body[meta_hash_pos + 5],
+    let meta_hash_offset = meta_hash_offset.ok_or(MetaError::MetaHashMissing)?;
+
+    // CRC covers everything BEFORE the MetaHash TLV.
+    if meta_hash_offset + 6 > body.len() {
+        return Err(MetaError::NoBytes);
+    }
+    let covered = &body[..meta_hash_offset];
+    let expected_crc = u32::from_le_bytes([
+        body[meta_hash_offset + 2],
+        body[meta_hash_offset + 3],
+        body[meta_hash_offset + 4],
+        body[meta_hash_offset + 5],
     ]);
-    if crc32fast::hash(to_hash) != expected {
+    if crc32fast::hash(covered) != expected_crc {
         return Err(MetaError::HeaderHashMismatch);
     }
 
-    // Now parse fields from the buffered body.
-    let mut iter = body[2..].iter().copied();
+    // Re-parse the verified body. Since the end marker was NOT buffered, push
+    // `0, 0` back so `from_tlv_field` sees the End sentinel where it expects it.
+    let mut parse_buf: Vec<u8> = body[2..].to_vec();
+    parse_buf.push(0);
+    parse_buf.push(0);
+    let mut iter = parse_buf.into_iter();
     let mut fields = Vec::new();
     loop {
         match MetaField::from_tlv_field(&mut iter)? {
@@ -727,21 +741,13 @@ VERSION_3 => {
             MetaFieldParseResult::Skip => continue,
         }
     }
-    // Note: end marker is not in body — adjust the loop or push 0,0 sentinel.
     Ok(Meta { version, fields })
 }
 ```
 
-Note: the existing `from_tlv_field` reads the end marker via `tag_byte == 0 && len == 0`. Since we trimmed the end marker, push it back before parsing:
+Note the two distinct error variants: `MetaError::MetaHashMissing` means the file is structurally invalid (no `MetaHash` TLV in the stream), while `MetaError::HeaderHashMismatch` means the file is structurally valid but tampered (CRC doesn't match). Do NOT conflate them.
 
-```rust
-let mut parse_buf: Vec<u8> = body[2..].to_vec();
-parse_buf.push(0);
-parse_buf.push(0);
-let mut iter = parse_buf.into_iter();
-```
-
-This is messier than the `Tee` approach but avoids a custom iterator type. Pick one and document the choice in a comment.
+The reference implementation is in `src/main.rs` — the `Tee` sketch above is an alternative approach and is NOT what the codebase uses.
 
 - [ ] **Step 4: Run, confirm green**
 
