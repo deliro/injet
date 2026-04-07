@@ -127,6 +127,7 @@ const MB: u32 = 1024 * 1024;
 const MB_MINUS_1: u32 = MB - 1;
 const GB: u32 = MB * 1024;
 const GB_MINUS_1: u32 = GB - 1;
+const MAX_FILENAME_LEN: usize = 255;
 
 #[inline]
 fn format_size(size: u32) -> String {
@@ -438,7 +439,7 @@ enum InjectError {
     },
     #[error("Failed to save output file: {0}")]
     CannotSave(String),
-    #[error("Filename is too long (maximum 255 bytes)")]
+    #[error("Filename is too long (maximum {} bytes)", MAX_FILENAME_LEN)]
     FilenameOverflow,
 }
 
@@ -614,7 +615,7 @@ fn inject(args: InjectArgs) -> Result<(), InjectError> {
             .file_name()
             .map(|v| String::from(v.to_string_lossy()));
         if let Some(v) = &filename {
-            if v.len() >= 255 {
+            if v.len() > MAX_FILENAME_LEN {
                 return Err(InjectError::FilenameOverflow);
             }
         }

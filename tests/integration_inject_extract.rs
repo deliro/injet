@@ -208,3 +208,38 @@ fn extract_with_wrong_or_missing_seed_fails(#[case] use_wrong_seed: bool) {
         false,
     );
 }
+
+#[test]
+fn inject_accepts_filename_of_exactly_255_bytes() {
+    let env = setup_env();
+    // 255 ASCII bytes total, including ".bin"
+    let stem: String = "a".repeat(251);
+    let filename = format!("{stem}.bin");
+    assert_eq!(filename.len(), 255);
+    let cargo_path = env.dir.path().join(&filename);
+    std::fs::write(&cargo_path, b"hello").unwrap();
+
+    let mut cmd = Command::cargo_bin("injet").unwrap();
+    cmd.args([
+        "inject",
+        cargo_path.to_str().unwrap(),
+        env.png_path.to_str().unwrap(),
+        "-d",
+        env.out_png_path.to_str().unwrap(),
+    ]);
+    cmd.assert().success();
+
+    // Round-trip: extract via -d (metadata-driven default filename is covered by Task 12).
+    // The 255-byte filename is still embedded in metadata and parsed end-to-end here.
+    let restored = env.dir.path().join("restored.bin");
+    let mut extract = Command::cargo_bin("injet").unwrap();
+    extract.args([
+        "extract",
+        env.out_png_path.to_str().unwrap(),
+        "-d",
+        restored.to_str().unwrap(),
+    ]);
+    extract.assert().success();
+
+    assert_eq!(std::fs::read(&restored).unwrap(), b"hello");
+}
