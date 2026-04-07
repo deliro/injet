@@ -176,10 +176,10 @@ fn pseudo_shuffle_coords(w: u32, h: u32, seed: &Seed) -> impl Iterator<Item = (u
     coords.into_iter()
 }
 
-fn gen_dots(w: u32, h: u32, seed: Option<&Seed>) -> Box<dyn Iterator<Item = (u32, u32)>> {
+fn gen_dots(w: u32, h: u32, seed: Option<&Seed>) -> impl Iterator<Item = (u32, u32)> {
     match seed {
-        Some(seed) => Box::new(pseudo_shuffle_coords(w, h, seed)),
-        None => Box::new(iter_dots(w, h)),
+        Some(seed) => itertools::Either::Left(pseudo_shuffle_coords(w, h, seed)),
+        None => itertools::Either::Right(iter_dots(w, h)),
     }
 }
 
