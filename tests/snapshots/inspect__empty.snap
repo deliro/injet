@@ -1,0 +1,7 @@
+---
+source: tests/inspect.rs
+expression: stdout
+---
+Dimensions: 80x80
+Maximum embeddable file size: 3.12 KB
+No embedded data detected or metadata is missing.
