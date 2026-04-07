@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::io;
 use std::io::Write;
-use std::io::{stdout, BufReader, BufWriter, IsTerminal, Read};
+use std::io::{stdout, BufReader, BufWriter, IsTerminal, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::process::exit;
 
@@ -884,18 +884,23 @@ fn inject(args: InjectArgs) -> Result<(), InjectError> {
                 return Err(InjectError::FilenameOverflow);
             }
         }
-        // Calculate crc32 on a separate file descriptor
+        // Calculate crc32 by streaming the cargo, then rewind for the bit pass
         let mut hasher = crc32fast::Hasher::new();
-        let mut crc_file = File::open(&args.cargo).map_err(|_| InjectError::CannotOpenCargo)?;
+        let mut reader = BufReader::new(&cargo);
         let mut buf = [0u8; 8192];
         loop {
-            let n = std::io::Read::read(&mut crc_file, &mut buf)
+            let n = reader
+                .read(&mut buf)
                 .map_err(|_| InjectError::CannotOpenCargo)?;
             if n == 0 {
                 break;
             }
             hasher.update(&buf[..n]);
         }
+        drop(reader);
+        (&cargo)
+            .rewind()
+            .map_err(|_| InjectError::CannotOpenCargo)?;
         let hash = hasher.finalize();
         let meta = Meta::make_v3(Some(cargo_size), filename, Some(hash));
         meta_bits.extend(meta.to_bits());
