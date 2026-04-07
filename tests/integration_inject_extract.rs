@@ -407,3 +407,29 @@ fn inject_succeeds_at_exact_capacity_without_meta() {
     .unwrap();
     assert_eq!(bytes, payload);
 }
+
+#[test]
+fn extract_does_not_leave_corrupt_file_on_hash_mismatch() {
+    let env = setup_env();
+    inject_file_into_png(&env.bin_path, &env.png_path, &env.out_png_path, true, None);
+    let corrupted = env.dir.path().join("corrupt.png");
+    corrupt_payload_bit(&env.out_png_path, &corrupted);
+
+    let mut cmd = Command::cargo_bin("injet").unwrap();
+    cmd.args([
+        "extract",
+        corrupted.to_str().unwrap(),
+        "-d",
+        env.extracted_bin_path.to_str().unwrap(),
+    ]);
+    cmd.assert().failure();
+
+    assert!(
+        !env.extracted_bin_path.exists(),
+        "extract must remove the partial output on hash mismatch (found leftover at {:?})",
+        env.extracted_bin_path
+    );
+    // Also no .partial file lingering
+    let partial = env.extracted_bin_path.with_extension("partial");
+    assert!(!partial.exists(), "no .partial file should remain");
+}
