@@ -18,7 +18,7 @@ fn main() {
     let cli = Cli::parse();
     let result: Result<(), (String, i32)> = match &cli.command {
         Commands::Inject(args) => inject::inject(args).map_err(|e| (e.to_string(), e.exit_code())),
-        Commands::Extract(args) => extract::extract(args).map_err(|e| (e.to_string(), 1_i32)),
+        Commands::Extract(args) => extract::extract(args).map_err(|e| (e.to_string(), e.exit_code())),
         Commands::Inspect(args) => inspect::inspect(args).map_err(|e| (e.to_string(), 1_i32)),
     };
     if let Err((msg, code)) = result {
