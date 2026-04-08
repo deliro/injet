@@ -18,6 +18,12 @@ itertools = "0.14"
 rand = "0.9"
 thiserror = "2"
 crc32fast = "1"
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "fast"] }
+ssh-key = { version = "0.6", default-features = false, features = ["ed25519", "alloc", "std"] }
+argon2 = { version = "0.5", default-features = false, features = ["std", "alloc"] }
+rpassword = "7"
+zeroize = { version = "1", features = ["zeroize_derive"] }
+getrandom = "0.2"
 
 # mimalloc upstream supports glibc Linux, macOS, Windows, and FreeBSD on the
 # tier-1 architectures we ship for. Excluded on musl and unknown targets where
