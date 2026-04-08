@@ -10,6 +10,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::{tempdir, TempDir};
 
+fn fixture(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/keys")
+        .join(name)
+}
+
 const TEST_PAYLOAD: &[u8] = include_bytes!("test_payload_2kb.bin");
 
 struct TestEnv {
@@ -449,4 +455,443 @@ fn extract_does_not_leave_corrupt_file_on_hash_mismatch() {
     // Also no .partial file lingering
     let partial = env.extracted_bin_path.with_extension("partial");
     assert!(!partial.exists(), "no .partial file should remain");
+}
+
+// ─── Auth helpers ────────────────────────────────────────────────────────────
+
+fn inject_psk(env: &TestEnv, psk_filename: &str) {
+    let mut cmd = Command::cargo_bin("injet").unwrap();
+    cmd.args([
+        "inject",
+        env.bin_path.to_str().unwrap(),
+        env.png_path.to_str().unwrap(),
+        "-d",
+        env.out_png_path.to_str().unwrap(),
+        "--psk-file",
+        fixture(psk_filename).to_str().unwrap(),
+    ]);
+    cmd.assert().success();
+}
+
+fn inject_ed25519(env: &TestEnv, key_filename: &str) {
+    let mut cmd = Command::cargo_bin("injet").unwrap();
+    cmd.args([
+        "inject",
+        env.bin_path.to_str().unwrap(),
+        env.png_path.to_str().unwrap(),
+        "-d",
+        env.out_png_path.to_str().unwrap(),
+        "--sign-key",
+        fixture(key_filename).to_str().unwrap(),
+    ]);
+    cmd.assert().success();
+}
+
+// ─── PSK roundtrip tests ─────────────────────────────────────────────────────
+
+#[test]
+fn psk_roundtrip_happy() {
+    let env = setup_env();
+    let mut inject = Command::cargo_bin("injet").unwrap();
+    inject.args([
+        "inject",
+        env.bin_path.to_str().unwrap(),
+        env.png_path.to_str().unwrap(),
+        "-d",
+        env.out_png_path.to_str().unwrap(),
+        "--psk-file",
+        fixture("psk.txt").to_str().unwrap(),
+    ]);
+    inject.assert().success();
+
+    let mut extract = Command::cargo_bin("injet").unwrap();
+    extract.args([
+        "extract",
+        env.out_png_path.to_str().unwrap(),
+        "-d",
+        env.extracted_bin_path.to_str().unwrap(),
+        "--psk-file",
+        fixture("psk.txt").to_str().unwrap(),
+    ]);
+    extract.assert().success();
+    assert_eq!(fs::read(&env.extracted_bin_path).unwrap(), TEST_PAYLOAD);
+}
+
+#[test]
+fn psk_roundtrip_wrong_passphrase() {
+    let env = setup_env();
+    let mut inject = Command::cargo_bin("injet").unwrap();
+    inject.args([
+        "inject",
+        env.bin_path.to_str().unwrap(),
+        env.png_path.to_str().unwrap(),
+        "-d",
+        env.out_png_path.to_str().unwrap(),
+        "--psk-file",
+        fixture("psk.txt").to_str().unwrap(),
+    ]);
+    inject.assert().success();
+
+    let mut extract = Command::cargo_bin("injet").unwrap();
+    extract.args([
+        "extract",
+        env.out_png_path.to_str().unwrap(),
+        "-d",
+        env.extracted_bin_path.to_str().unwrap(),
+        "--psk-file",
+        fixture("wrong_psk.txt").to_str().unwrap(),
+    ]);
+    extract
+        .assert()
+        .failure()
+        .code(2_i32)
+        .stderr(predicate::str::contains("verification failed"));
+    assert!(!env.extracted_bin_path.exists());
+}
+
+#[test]
+fn psk_signed_extract_no_key() {
+    let env = setup_env();
+    inject_psk(&env, "psk.txt");
+    let mut extract = Command::cargo_bin("injet").unwrap();
+    extract.args([
+        "extract",
+        env.out_png_path.to_str().unwrap(),
+        "-d",
+        env.extracted_bin_path.to_str().unwrap(),
+    ]);
+    extract
+        .assert()
+        .failure()
+        .code(2_i32)
+        .stderr(predicate::str::contains("no verification key was provided"));
+}
+
+#[test]
+fn psk_signed_extract_insecure_skip() {
+    let env = setup_env();
+    inject_psk(&env, "psk.txt");
+    let mut extract = Command::cargo_bin("injet").unwrap();
+    extract.args([
+        "extract",
+        env.out_png_path.to_str().unwrap(),
+        "-d",
+        env.extracted_bin_path.to_str().unwrap(),
+        "--insecure-skip-verify",
+    ]);
+    extract
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("WARNING:"));
+    assert_eq!(fs::read(&env.extracted_bin_path).unwrap(), TEST_PAYLOAD);
+}
+
+#[test]
+fn psk_roundtrip_tampered_payload() {
+    let env = setup_env();
+    inject_psk(&env, "psk.txt");
+    let corrupted = env.dir.path().join("corrupt.png");
+    corrupt_payload_bit(&env.out_png_path, &corrupted);
+    let mut extract = Command::cargo_bin("injet").unwrap();
+    extract.args([
+        "extract",
+        corrupted.to_str().unwrap(),
+        "-d",
+        env.extracted_bin_path.to_str().unwrap(),
+        "--psk-file",
+        fixture("psk.txt").to_str().unwrap(),
+    ]);
+    extract.assert().failure(); // CRC32 fires first → HashMismatch (exit 1)
+    assert!(!env.extracted_bin_path.exists());
+}
+
+// ─── Ed25519 roundtrip tests ──────────────────────────────────────────────────
+
+#[test]
+fn ed25519_roundtrip_happy() {
+    let env = setup_env();
+    inject_ed25519(&env, "signer_ed25519");
+    let mut extract = Command::cargo_bin("injet").unwrap();
+    extract.args([
+        "extract",
+        env.out_png_path.to_str().unwrap(),
+        "-d",
+        env.extracted_bin_path.to_str().unwrap(),
+        "--verify-key",
+        fixture("signer_ed25519.pub").to_str().unwrap(),
+    ]);
+    extract.assert().success();
+    assert_eq!(fs::read(&env.extracted_bin_path).unwrap(), TEST_PAYLOAD);
+}
+
+#[test]
+fn ed25519_roundtrip_wrong_pubkey() {
+    let env = setup_env();
+    inject_ed25519(&env, "signer_ed25519");
+    let mut extract = Command::cargo_bin("injet").unwrap();
+    extract.args([
+        "extract",
+        env.out_png_path.to_str().unwrap(),
+        "-d",
+        env.extracted_bin_path.to_str().unwrap(),
+        "--verify-key",
+        fixture("wrong_signer_ed25519.pub").to_str().unwrap(),
+    ]);
+    extract
+        .assert()
+        .failure()
+        .code(2_i32)
+        .stderr(predicate::str::contains("verification failed"));
+    assert!(!env.extracted_bin_path.exists());
+}
+
+#[test]
+fn ed25519_signed_extract_no_key() {
+    let env = setup_env();
+    inject_ed25519(&env, "signer_ed25519");
+    let mut extract = Command::cargo_bin("injet").unwrap();
+    extract.args([
+        "extract",
+        env.out_png_path.to_str().unwrap(),
+        "-d",
+        env.extracted_bin_path.to_str().unwrap(),
+    ]);
+    extract
+        .assert()
+        .failure()
+        .code(2_i32)
+        .stderr(predicate::str::contains("no verification key was provided"));
+}
+
+#[test]
+fn ed25519_signed_extract_insecure_skip() {
+    let env = setup_env();
+    inject_ed25519(&env, "signer_ed25519");
+    let mut extract = Command::cargo_bin("injet").unwrap();
+    extract.args([
+        "extract",
+        env.out_png_path.to_str().unwrap(),
+        "-d",
+        env.extracted_bin_path.to_str().unwrap(),
+        "--insecure-skip-verify",
+    ]);
+    extract
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("WARNING:"));
+}
+
+#[test]
+fn ed25519_signed_extract_with_psk_key_rejected() {
+    let env = setup_env();
+    inject_ed25519(&env, "signer_ed25519");
+    let mut extract = Command::cargo_bin("injet").unwrap();
+    extract.args([
+        "extract",
+        env.out_png_path.to_str().unwrap(),
+        "-d",
+        env.extracted_bin_path.to_str().unwrap(),
+        "--psk-file",
+        fixture("psk.txt").to_str().unwrap(),
+    ]);
+    extract
+        .assert()
+        .failure()
+        .code(2_i32)
+        .stderr(predicate::str::contains("ed25519").and(predicate::str::contains("psk")));
+}
+
+#[test]
+fn ed25519_encrypted_key_with_passphrase_file() {
+    let env = setup_env();
+    let passphrase_file = env.dir.path().join("passphrase.txt");
+    std::fs::write(&passphrase_file, b"test-passphrase\n").unwrap();
+    let mut inject = Command::cargo_bin("injet").unwrap();
+    inject.args([
+        "inject",
+        env.bin_path.to_str().unwrap(),
+        env.png_path.to_str().unwrap(),
+        "-d",
+        env.out_png_path.to_str().unwrap(),
+        "--sign-key",
+        fixture("signer_ed25519_encrypted").to_str().unwrap(),
+        "--sign-key-passphrase-file",
+        passphrase_file.to_str().unwrap(),
+    ]);
+    inject.assert().success();
+
+    let mut extract = Command::cargo_bin("injet").unwrap();
+    extract.args([
+        "extract",
+        env.out_png_path.to_str().unwrap(),
+        "-d",
+        env.extracted_bin_path.to_str().unwrap(),
+        "--verify-key",
+        fixture("signer_ed25519_encrypted.pub").to_str().unwrap(),
+    ]);
+    extract.assert().success();
+    assert_eq!(fs::read(&env.extracted_bin_path).unwrap(), TEST_PAYLOAD);
+}
+
+#[test]
+fn ed25519_encrypted_key_wrong_passphrase() {
+    let env = setup_env();
+    let bad_pass = env.dir.path().join("bad.txt");
+    std::fs::write(&bad_pass, b"wrong\n").unwrap();
+    let mut inject = Command::cargo_bin("injet").unwrap();
+    inject.args([
+        "inject",
+        env.bin_path.to_str().unwrap(),
+        env.png_path.to_str().unwrap(),
+        "-d",
+        env.out_png_path.to_str().unwrap(),
+        "--sign-key",
+        fixture("signer_ed25519_encrypted").to_str().unwrap(),
+        "--sign-key-passphrase-file",
+        bad_pass.to_str().unwrap(),
+    ]);
+    inject
+        .assert()
+        .failure()
+        .code(2_i32)
+        .stderr(predicate::str::contains("decrypt"));
+}
+
+// ─── Cross-cutting negatives ──────────────────────────────────────────────────
+
+#[test]
+fn unsigned_extract_with_verify_key_rejected() {
+    let env = setup_env();
+    inject_file_into_png(&env.bin_path, &env.png_path, &env.out_png_path, true, None);
+    let mut extract = Command::cargo_bin("injet").unwrap();
+    extract.args([
+        "extract",
+        env.out_png_path.to_str().unwrap(),
+        "-d",
+        env.extracted_bin_path.to_str().unwrap(),
+        "--verify-key",
+        fixture("signer_ed25519.pub").to_str().unwrap(),
+    ]);
+    extract
+        .assert()
+        .failure()
+        .code(2_i32)
+        .stderr(predicate::str::contains("not signed"));
+}
+
+#[test]
+fn inject_two_auth_modes_rejected_by_clap() {
+    let env = setup_env();
+    let mut cmd = Command::cargo_bin("injet").unwrap();
+    cmd.args([
+        "inject",
+        env.bin_path.to_str().unwrap(),
+        env.png_path.to_str().unwrap(),
+        "-d",
+        env.out_png_path.to_str().unwrap(),
+        "--psk-file",
+        fixture("psk.txt").to_str().unwrap(),
+        "--sign-key",
+        fixture("signer_ed25519").to_str().unwrap(),
+    ]);
+    cmd.assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
+#[test]
+fn inject_psk_with_no_meta_rejected() {
+    let env = setup_env();
+    let mut cmd = Command::cargo_bin("injet").unwrap();
+    cmd.args([
+        "inject",
+        env.bin_path.to_str().unwrap(),
+        env.png_path.to_str().unwrap(),
+        "-d",
+        env.out_png_path.to_str().unwrap(),
+        "--write-meta",
+        "false",
+        "--psk-file",
+        fixture("psk.txt").to_str().unwrap(),
+    ]);
+    cmd.assert()
+        .failure()
+        .code(2_i32)
+        .stderr(predicate::str::contains("Signing requires metadata"));
+}
+
+#[test]
+fn inject_sign_key_with_no_meta_rejected() {
+    let env = setup_env();
+    let mut cmd = Command::cargo_bin("injet").unwrap();
+    cmd.args([
+        "inject",
+        env.bin_path.to_str().unwrap(),
+        env.png_path.to_str().unwrap(),
+        "-d",
+        env.out_png_path.to_str().unwrap(),
+        "--write-meta",
+        "false",
+        "--sign-key",
+        fixture("signer_ed25519").to_str().unwrap(),
+    ]);
+    cmd.assert()
+        .failure()
+        .code(2_i32)
+        .stderr(predicate::str::contains("Signing requires metadata"));
+}
+
+// ─── Per-container distinct salts ────────────────────────────────────────────
+
+#[test]
+fn psk_two_containers_have_distinct_salts() {
+    let env = setup_env();
+    let png_a = env.dir.path().join("a.png");
+    let png_b = env.dir.path().join("b.png");
+
+    for out in [&png_a, &png_b] {
+        let mut cmd = Command::cargo_bin("injet").unwrap();
+        cmd.args([
+            "inject",
+            env.bin_path.to_str().unwrap(),
+            env.png_path.to_str().unwrap(),
+            "-d",
+            out.to_str().unwrap(),
+            "--psk-file",
+            fixture("psk.txt").to_str().unwrap(),
+        ]);
+        cmd.assert().success();
+    }
+
+    let salt_a = read_salt_from_png(&png_a);
+    let salt_b = read_salt_from_png(&png_b);
+    assert_ne!(salt_a, salt_b, "two PSK containers must have distinct salts");
+}
+
+fn read_salt_from_png(png_path: &Path) -> [u8; 16] {
+    use image::GenericImageView;
+    use injet::lsb::gen_dots;
+    use injet::meta::{Meta, MetaField};
+    use itertools::Itertools;
+
+    let img = image::open(png_path).unwrap();
+    let (w, h) = img.dimensions();
+    let bytes = gen_dots(w, h, None)
+        .flat_map(|(x, y)| img.get_pixel(x, y).0)
+        .map(|v| v & 1)
+        .chunks(8);
+    let mut content = bytes.into_iter().map(|chunk| {
+        chunk
+            .zip((0_u8..8).rev())
+            .map(|(bit, shift)| bit << shift)
+            .sum::<u8>()
+    });
+    let meta = Meta::read(&mut content).unwrap();
+    meta.fields
+        .iter()
+        .find_map(|f| match f {
+            MetaField::Mac { salt, .. } => Some(*salt),
+            _ => None,
+        })
+        .unwrap()
 }
