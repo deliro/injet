@@ -107,6 +107,9 @@ fn print_meta<I: Iterator<Item = u8>>(meta: &Meta, content: &mut I) {
     if let Some(meta_hash) = meta.meta_hash() {
         println!("Header CRC32: {meta_hash:08x}");
     }
+    if let Some(algo) = crate::auth::detect_auth(&meta.fields) {
+        println!("Signed: {algo}");
+    }
     let Some(expected_hash) = meta.hash() else {
         return;
     };
