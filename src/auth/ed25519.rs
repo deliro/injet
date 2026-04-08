@@ -125,6 +125,25 @@ fn is_tty() -> bool {
     std::io::stdin().is_terminal()
 }
 
+use crate::meta::{AuthField, Signer};
+
+pub struct Ed25519Signer {
+    inner: SigningKey,
+}
+
+impl Ed25519Signer {
+    #[must_use]
+    pub fn new(inner: SigningKey) -> Self {
+        Self { inner }
+    }
+}
+
+impl Signer for Ed25519Signer {
+    fn sign(&self, auth_input: &[u8]) -> AuthField {
+        AuthField::Signature(sign_ed25519(&self.inner, auth_input))
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
