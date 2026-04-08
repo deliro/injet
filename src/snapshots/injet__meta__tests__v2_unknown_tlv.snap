@@ -13,5 +13,6 @@ Ok(
                 "x.zip",
             ),
         ],
+        auth_prefix: None,
     },
 )

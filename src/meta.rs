@@ -307,6 +307,11 @@ fn parse_u32_field(bytes: &[u8]) -> Result<u32, MetaError> {
 pub struct Meta {
     pub version: u8,
     pub fields: Vec<MetaField>,
+    /// Bytes from the start of the v3 header up to (but not including) the
+    /// auth TLV's tag byte. Populated by `read_v3` only when the container
+    /// has a `Mac` or `Signature` TLV. None for v1, v2, unsigned v3, and
+    /// freshly-constructed `Meta`.
+    pub auth_prefix: Option<Vec<u8>>,
 }
 
 impl Meta {
@@ -424,6 +429,7 @@ impl Meta {
         Self {
             version: VERSION_2,
             fields,
+            auth_prefix: None,
         }
     }
 
@@ -446,6 +452,7 @@ impl Meta {
         Self {
             version: VERSION_3,
             fields,
+            auth_prefix: None,
         }
     }
 
@@ -471,7 +478,7 @@ impl Meta {
         match version {
             VERSION_1 => {
                 let fields = MetaField::from_v1_header(value)?;
-                Ok(Meta { version, fields })
+                Ok(Meta { version, fields, auth_prefix: None })
             }
             VERSION_2 => {
                 let mut fields = Vec::new();
@@ -482,7 +489,7 @@ impl Meta {
                         MetaFieldParseResult::Skip => {}
                     }
                 }
-                Ok(Meta { version, fields })
+                Ok(Meta { version, fields, auth_prefix: None })
             }
             VERSION_3 => Self::read_v3(value, [sig0, sig1]),
             v => Err(MetaError::UnsupportedVersion(v)),
@@ -501,6 +508,8 @@ impl Meta {
         let mut body: Vec<u8> = Vec::with_capacity(64);
         body.extend(sig_bytes);
         let mut meta_hash_offset: Option<usize> = None;
+        let mut auth_offset: Option<usize> = None;
+        let mut auth_count: u32 = 0;
         loop {
             let field_start = body.len();
             let tag = value.next().ok_or(MetaError::NoBytes)?;
@@ -527,8 +536,18 @@ impl Meta {
             if tag == u8::from(MetaTag::MetaHash) && meta_hash_offset.is_none() {
                 meta_hash_offset = Some(field_start);
             }
+            if tag == u8::from(MetaTag::Mac) || tag == u8::from(MetaTag::Signature) {
+                if auth_offset.is_none() {
+                    auth_offset = Some(field_start);
+                }
+                auth_count = auth_count.saturating_add(1);
+            }
         }
         let meta_hash_offset = meta_hash_offset.ok_or(MetaError::MetaHashMissing)?;
+
+        if auth_count > 1 {
+            return Err(MetaError::MultipleAuthFields);
+        }
 
         // CRC covers everything BEFORE the MetaHash TLV.
         let meta_hash_end = meta_hash_offset
@@ -558,9 +577,11 @@ impl Meta {
                 MetaFieldParseResult::Skip => {}
             }
         }
+        let auth_prefix = auth_offset.and_then(|off| body.get(..off).map(<[u8]>::to_vec));
         Ok(Meta {
             version: VERSION_3,
             fields,
+            auth_prefix,
         })
     }
 
@@ -813,6 +834,34 @@ mod tests {
         bytes
     }
 
+    fn build_v3_with_both_mac_and_sig() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let signature = (MAGIC << 3_u32) | u16::from(VERSION_3);
+        bytes.extend(signature.to_le_bytes());
+        // Size TLV
+        bytes.push(1);
+        bytes.push(4);
+        bytes.extend(0_u32.to_le_bytes());
+        // CRC over everything written so far (the 2 sig bytes + Size TLV)
+        let crc = crc32fast::hash(&bytes);
+        // MetaHash TLV
+        bytes.push(4);
+        bytes.push(4);
+        bytes.extend(crc.to_le_bytes());
+        // Mac TLV
+        bytes.push(5);
+        bytes.push(48);
+        bytes.extend([0_u8; 48]);
+        // Signature TLV
+        bytes.push(6);
+        bytes.push(64);
+        bytes.extend([0_u8; 64]);
+        // End marker
+        bytes.push(0);
+        bytes.push(0);
+        bytes
+    }
+
     #[rstest]
     #[case::v1("v1", build_v1_bytes())]
     #[case::v2_roundtrip("v2_roundtrip", build_v2_roundtrip())]
@@ -832,6 +881,7 @@ mod tests {
     #[case::v3_mac_wrong_length_short("v3_mac_wrong_length_short", build_v3_mac_wrong_length_short())]
     #[case::v3_mac_wrong_length_long("v3_mac_wrong_length_long", build_v3_mac_wrong_length_long())]
     #[case::v3_signature_wrong_length("v3_signature_wrong_length", build_v3_signature_wrong_length())]
+    #[case::v3_with_both_mac_and_sig("v3_with_both_mac_and_sig", build_v3_with_both_mac_and_sig())]
     fn meta_parse(#[case] name: &str, #[case] bytes: Vec<u8>) {
         let mut iter = bytes.into_iter();
         insta::assert_debug_snapshot!(name, Meta::read(&mut iter));

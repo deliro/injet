@@ -13,5 +13,6 @@ Ok(
                 "hello.zip",
             ),
         ],
+        auth_prefix: None,
     },
 )
