@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{arg, Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use image::codecs::png::CompressionType;
 
 use crate::lsb::Seed;
