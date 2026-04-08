@@ -73,3 +73,87 @@ fn extract_reads_legacy_v1_format() {
     cmd.assert().success();
     assert_eq!(std::fs::read(&extracted).unwrap(), payload);
 }
+
+#[test]
+fn v3_unsigned_extract_succeeds_without_key() {
+    // Round-trip an unsigned v3 container through inject + extract.
+    // This is the regression check that the new auth code did NOT break
+    // the unsigned-with-metadata happy path.
+    let dir = tempdir().unwrap();
+    let png_path = dir.path().join("cover.png");
+    let payload_path = dir.path().join("payload.bin");
+    let signed_path = dir.path().join("signed.png");
+    let extracted_path = dir.path().join("out.bin");
+
+    let img: ImageBuffer<Rgba<u8>, Vec<u8>> =
+        ImageBuffer::from_fn(50, 50, |_, _| Rgba([255, 255, 255, 255]));
+    img.save(&png_path).unwrap();
+    std::fs::write(&payload_path, b"hello world").unwrap();
+
+    let mut inject = Command::cargo_bin("injet").unwrap();
+    inject.args([
+        "inject",
+        payload_path.to_str().unwrap(),
+        png_path.to_str().unwrap(),
+        "-d",
+        signed_path.to_str().unwrap(),
+    ]);
+    inject.assert().success();
+
+    let mut extract = Command::cargo_bin("injet").unwrap();
+    extract.args([
+        "extract",
+        signed_path.to_str().unwrap(),
+        "-d",
+        extracted_path.to_str().unwrap(),
+    ]);
+    extract.assert().success();
+    assert_eq!(std::fs::read(&extracted_path).unwrap(), b"hello world");
+}
+
+#[test]
+fn v3_unsigned_extract_with_verify_key_rejected() {
+    // Strict policy: an unsigned container must be rejected when the user
+    // explicitly asks for verification by passing --verify-key. The new
+    // release returns exit code 2 with "not signed" in stderr.
+    let dir = tempdir().unwrap();
+    let png_path = dir.path().join("cover.png");
+    let payload_path = dir.path().join("payload.bin");
+    let signed_path = dir.path().join("unsigned.png");
+    let extracted_path = dir.path().join("out.bin");
+
+    let img: ImageBuffer<Rgba<u8>, Vec<u8>> =
+        ImageBuffer::from_fn(50, 50, |_, _| Rgba([255, 255, 255, 255]));
+    img.save(&png_path).unwrap();
+    std::fs::write(&payload_path, b"data").unwrap();
+
+    let mut inject = Command::cargo_bin("injet").unwrap();
+    inject.args([
+        "inject",
+        payload_path.to_str().unwrap(),
+        png_path.to_str().unwrap(),
+        "-d",
+        signed_path.to_str().unwrap(),
+    ]);
+    inject.assert().success();
+
+    let pubkey_fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/keys/signer_ed25519.pub");
+
+    let mut extract = Command::cargo_bin("injet").unwrap();
+    extract.args([
+        "extract",
+        signed_path.to_str().unwrap(),
+        "-d",
+        extracted_path.to_str().unwrap(),
+        "--verify-key",
+        pubkey_fixture.to_str().unwrap(),
+    ]);
+    extract
+        .assert()
+        .failure()
+        .code(2_i32)
+        .stderr(predicates::str::contains("not signed"));
+    // Payload must NOT be on disk.
+    assert!(!extracted_path.exists());
+}
