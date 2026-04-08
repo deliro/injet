@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.1.1] - 2026-04-08
+
+### Infrastructure
+- GitHub Actions CI runs `rustfmt`, `clippy`, and `cargo test` on Linux,
+  macOS, and Windows for every push and pull request.
+- GitHub Actions release workflow builds and publishes prebuilt binaries
+  for `x86_64`/`aarch64` Linux (gnu and musl), `x86_64`/`aarch64` macOS,
+  and `x86_64` Windows on every `v*` tag, and publishes the crate to
+  crates.io.
+
+### Fixed
+- Removed an unused `clap::arg` import that newer stable rustc flags
+  under the project's `-D warnings` policy.
+
 ## [1.1.0] - 2026-04-08
 
 ### Added
