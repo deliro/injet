@@ -1,5 +1,39 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- Optional cryptographic authentication for containers via two opt-in modes:
+  pre-shared passphrase (Argon2id key derivation + BLAKE3 keyed-hash MAC,
+  48-byte Mac TLV embedding a per-container 16-byte salt) and Ed25519
+  signatures (64-byte Signature TLV).
+- New `inject` flags: `--psk-file`, `--psk-env`, `--psk-prompt`, `--sign-key`,
+  `--sign-key-passphrase-{file,env,prompt}`. PSK and Ed25519 flags are
+  mutually exclusive.
+- New `extract` flags: `--psk-file`, `--psk-env`, `--psk-prompt`,
+  `--verify-key`, `--verify-key-env`, `--insecure-skip-verify`.
+- `inspect` reports `Signed: psk` / `Signed: ed25519` for signed containers.
+- Strict-by-default verification policy: `extract` refuses to write a signed
+  container's payload unless the supplied key verifies; explicit
+  `--insecure-skip-verify` opt-out always prints a stderr warning.
+- Exit code 2 for all auth and key errors (existing errors stay at 1).
+- Test fixtures under `tests/fixtures/keys/` (Ed25519 keypairs, encrypted
+  variant, wrong-key, PSK passphrase files).
+
+### Compatibility
+- Unsigned containers from any prior version (v1/v2/v3) still extract.
+- Unsigned `inject` behavior is unchanged.
+- `--write-meta=false` is now mutually exclusive with any signing flag
+  (signing requires the metadata header to carry the auth TLV).
+- Older `injet` binaries (before this release) silently skip the new auth
+  TLVs and extract signed containers without verification. **Both ends must
+  use this release or newer for signature verification to be effective.**
+
+### Dependencies
+- New: `ed25519-dalek 2`, `ssh-key 0.6` (with `encryption` feature),
+  `argon2 0.5`, `rpassword 7`, `zeroize 1`, `getrandom 0.2`. All pure Rust,
+  no C bindings.
+
 ## [1.0.0] - 2026-04-08
 
 ### Breaking
