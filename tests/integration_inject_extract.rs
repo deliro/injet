@@ -865,7 +865,10 @@ fn psk_two_containers_have_distinct_salts() {
 
     let salt_a = read_salt_from_png(&png_a);
     let salt_b = read_salt_from_png(&png_b);
-    assert_ne!(salt_a, salt_b, "two PSK containers must have distinct salts");
+    assert_ne!(
+        salt_a, salt_b,
+        "two PSK containers must have distinct salts"
+    );
 }
 
 fn read_salt_from_png(png_path: &Path) -> [u8; 16] {

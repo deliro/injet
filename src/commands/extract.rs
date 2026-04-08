@@ -154,11 +154,14 @@ fn run_verify(
     let spec = args
         .verify_spec()
         .ok_or(crate::auth::AuthError::KeyRequired)?;
-    let fields_slice: &[crate::meta::MetaField] =
-        meta.map_or(&[], |m| m.fields.as_slice());
+    let fields_slice: &[crate::meta::MetaField] = meta.map_or(&[], |m| m.fields.as_slice());
     let job = crate::auth::pair_up(&spec, fields_slice)?;
     match job {
-        crate::auth::VerifyJob::Psk { passphrase, salt, mac } => {
+        crate::auth::VerifyJob::Psk {
+            passphrase,
+            salt,
+            mac,
+        } => {
             let key = crate::auth::psk::derive_psk(passphrase.as_slice(), &salt)
                 .map_err(|_| crate::auth::AuthError::VerificationFailed)?;
             if !crate::auth::psk::verify_psk(&key, &auth_input, &mac) {

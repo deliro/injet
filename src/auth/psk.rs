@@ -17,11 +17,7 @@ const ARGON2_P: u32 = 4;
 pub fn derive_psk(passphrase: &[u8], salt: &[u8; 16]) -> Result<[u8; 32], KeyError> {
     let params = argon2::Params::new(ARGON2_M_KIB, ARGON2_T, ARGON2_P, Some(32))
         .map_err(|_| KeyError::Argon2Params)?;
-    let argon2 = argon2::Argon2::new(
-        argon2::Algorithm::Argon2id,
-        argon2::Version::V0x13,
-        params,
-    );
+    let argon2 = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
     let mut out = [0_u8; 32];
     argon2
         .hash_password_into(passphrase, salt, &mut out)
@@ -86,7 +82,10 @@ impl PskSigner {
 impl Signer for PskSigner {
     fn sign(&self, auth_input: &[u8]) -> AuthField {
         let mac = psk_mac(&self.key, auth_input);
-        AuthField::Mac { salt: self.salt, mac }
+        AuthField::Mac {
+            salt: self.salt,
+            mac,
+        }
     }
 }
 

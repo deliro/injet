@@ -137,8 +137,8 @@ fn v3_unsigned_extract_with_verify_key_rejected() {
     ]);
     inject.assert().success();
 
-    let pubkey_fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/keys/signer_ed25519.pub");
+    let pubkey_fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/keys/signer_ed25519.pub");
 
     let mut extract = Command::cargo_bin("injet").unwrap();
     extract.args([
