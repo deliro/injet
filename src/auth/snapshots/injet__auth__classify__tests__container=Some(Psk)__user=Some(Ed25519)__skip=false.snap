@@ -1,0 +1,8 @@
+---
+source: src/auth/classify.rs
+expression: decision
+---
+RejectAlgorithmMismatch {
+    expected: Psk,
+    actual: Ed25519,
+}
