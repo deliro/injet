@@ -5,6 +5,66 @@ use image::codecs::png::CompressionType;
 
 use crate::lsb::Seed;
 
+#[derive(Debug, Args, Clone)]
+pub struct PassphraseFlags {
+    /// Read PSK passphrase from a file (one trailing newline stripped, max 4 KiB).
+    #[arg(long)]
+    pub psk_file: Option<PathBuf>,
+
+    /// Read PSK passphrase from an environment variable.
+    #[arg(long)]
+    pub psk_env: Option<String>,
+
+    /// Prompt for PSK passphrase on a TTY.
+    #[arg(long)]
+    pub psk_prompt: bool,
+}
+
+impl PassphraseFlags {
+    #[must_use]
+    pub fn into_source(self) -> Option<crate::auth::passphrase::PassphraseSource> {
+        if let Some(p) = self.psk_file {
+            Some(crate::auth::passphrase::PassphraseSource::File(p))
+        } else if let Some(v) = self.psk_env {
+            Some(crate::auth::passphrase::PassphraseSource::Env(v))
+        } else if self.psk_prompt {
+            Some(crate::auth::passphrase::PassphraseSource::Prompt)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct SignKeyPassphraseFlags {
+    /// Read the Ed25519 private key passphrase from a file.
+    #[arg(long)]
+    pub sign_key_passphrase_file: Option<PathBuf>,
+
+    /// Read the Ed25519 private key passphrase from an environment variable.
+    #[arg(long)]
+    pub sign_key_passphrase_env: Option<String>,
+
+    /// Prompt for the Ed25519 private key passphrase on a TTY.
+    #[arg(long)]
+    pub sign_key_passphrase_prompt: bool,
+}
+
+impl SignKeyPassphraseFlags {
+    #[must_use]
+    pub fn into_source(self) -> Option<crate::auth::passphrase::PassphraseSource> {
+        if let Some(p) = self.sign_key_passphrase_file {
+            Some(crate::auth::passphrase::PassphraseSource::File(p))
+        } else if let Some(v) = self.sign_key_passphrase_env {
+            Some(crate::auth::passphrase::PassphraseSource::Env(v))
+        } else if self.sign_key_passphrase_prompt {
+            Some(crate::auth::passphrase::PassphraseSource::Prompt)
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(author, version, about, long_about)]
 pub struct Cli {
@@ -68,6 +128,29 @@ pub struct InjectArgs {
     /// to correctly recover the data.
     #[arg(long)]
     pub seed: Option<Seed>,
+
+    #[command(flatten)]
+    pub psk: PassphraseFlags,
+
+    /// Sign the container with an OpenSSH Ed25519 private key.
+    #[arg(long, conflicts_with_all = ["psk_file", "psk_env", "psk_prompt"])]
+    pub sign_key: Option<PathBuf>,
+
+    #[command(flatten)]
+    pub sign_key_passphrase: SignKeyPassphraseFlags,
+}
+
+impl InjectArgs {
+    #[must_use]
+    pub fn auth_spec(&self) -> Option<crate::auth::AuthSpec> {
+        if let Some(src) = self.psk.clone().into_source() {
+            return Some(crate::auth::AuthSpec::Psk(src));
+        }
+        self.sign_key.clone().map(|key_path| crate::auth::AuthSpec::Ed25519 {
+            key_path,
+            key_passphrase: self.sign_key_passphrase.clone().into_source(),
+        })
+    }
 }
 
 #[derive(Args)]
@@ -95,6 +178,39 @@ pub struct ExtractArgs {
     /// Must match the seed used during injection, if any.
     #[arg(long)]
     pub seed: Option<Seed>,
+
+    #[command(flatten)]
+    pub psk: PassphraseFlags,
+
+    /// OpenSSH Ed25519 public key file for verification.
+    #[arg(long, conflicts_with_all = ["psk_file", "psk_env", "psk_prompt"])]
+    pub verify_key: Option<PathBuf>,
+
+    /// Inline OpenSSH public key string from environment variable.
+    #[arg(long)]
+    pub verify_key_env: Option<String>,
+
+    /// Skip signature verification on a signed container. Always prints a stderr warning.
+    #[arg(long)]
+    pub insecure_skip_verify: bool,
+}
+
+impl ExtractArgs {
+    #[must_use]
+    pub fn verify_spec(&self) -> Option<crate::auth::VerifySpec> {
+        if let Some(src) = self.psk.clone().into_source() {
+            return Some(crate::auth::VerifySpec::Psk(src));
+        }
+        if let Some(p) = self.verify_key.clone() {
+            return Some(crate::auth::VerifySpec::Ed25519Path(p));
+        }
+        if let Some(name) = &self.verify_key_env {
+            if let Ok(value) = std::env::var(name) {
+                return Some(crate::auth::VerifySpec::Ed25519Inline(value));
+            }
+        }
+        None
+    }
 }
 
 #[derive(Args)]
