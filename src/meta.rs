@@ -55,6 +55,25 @@ pub enum MetaField {
     Signature([u8; 64]),
 }
 
+#[derive(Debug)]
+pub enum AuthField {
+    Mac { salt: [u8; 16], mac: [u8; 32] },
+    Signature([u8; 64]),
+}
+
+impl AuthField {
+    fn into_meta_field(self) -> MetaField {
+        match self {
+            AuthField::Mac { salt, mac } => MetaField::Mac { salt, mac },
+            AuthField::Signature(sig) => MetaField::Signature(sig),
+        }
+    }
+}
+
+pub trait Signer {
+    fn sign(&self, auth_input: &[u8]) -> AuthField;
+}
+
 pub enum MetaFieldParseResult {
     Field(MetaField),
     End,
@@ -347,6 +366,44 @@ impl Meta {
         } else {
             self.write_all_fields(&mut result)?;
         }
+        result.push(0);
+        result.push(0);
+        Ok(result)
+    }
+
+    /// Serialize the metadata header, compute `auth_input = prefix || payload`,
+    /// invoke `signer.sign(auth_input)`, and append the resulting auth TLV
+    /// followed by the end marker.
+    ///
+    /// Only valid for `VERSION_3` metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MetaError::UnsupportedWriteVersion`] if `self.version != VERSION_3`,
+    /// or [`MetaError::FieldTooLong`] / [`MetaError::MultipleAuthFields`] from
+    /// the underlying `MetaField::write_into` / format invariant checks.
+    pub fn to_bytes_with_auth<S: Signer + ?Sized>(
+        &self,
+        payload: &[u8],
+        signer: &S,
+    ) -> Result<Vec<u8>, MetaError> {
+        if self.version != VERSION_3 {
+            return Err(MetaError::UnsupportedWriteVersion(self.version));
+        }
+        let mut result = Vec::with_capacity(64);
+        let signature: u16 = (MAGIC << 3_u32) | u16::from(VERSION_3);
+        result.extend(signature.to_le_bytes());
+        self.write_fields_excluding_meta_hash_and_auth(&mut result)?;
+        let crc = crc32fast::hash(&result);
+        MetaField::MetaHash(crc).write_into(&mut result)?;
+        // auth_input = prefix bytes (header up to and including MetaHash TLV) || payload
+        let mut auth_input: Vec<u8> = Vec::with_capacity(
+            result.len().saturating_add(payload.len()),
+        );
+        auth_input.extend_from_slice(&result);
+        auth_input.extend_from_slice(payload);
+        let auth_field = signer.sign(&auth_input);
+        auth_field.into_meta_field().write_into(&mut result)?;
         result.push(0);
         result.push(0);
         Ok(result)
@@ -778,5 +835,68 @@ mod tests {
     fn meta_parse(#[case] name: &str, #[case] bytes: Vec<u8>) {
         let mut iter = bytes.into_iter();
         insta::assert_debug_snapshot!(name, Meta::read(&mut iter));
+    }
+
+    #[test]
+    fn to_bytes_with_auth_round_trip_mac() {
+        struct Fake;
+        impl super::Signer for Fake {
+            fn sign(&self, auth_input: &[u8]) -> super::AuthField {
+                let mut salt = [0_u8; 16];
+                let mut mac = [0_u8; 32];
+                for (slot, byte) in salt.iter_mut().zip(auth_input.iter().take(16)) {
+                    *slot = *byte;
+                }
+                for (slot, byte) in mac.iter_mut().zip(auth_input.iter().take(32)) {
+                    *slot = *byte;
+                }
+                super::AuthField::Mac { salt, mac }
+            }
+        }
+        let meta = super::Meta::make_v3(Some(8), Some("x.bin".into()), Some(0));
+        let payload = b"PAYLOAD!";
+        let bytes = meta.to_bytes_with_auth(payload, &Fake).unwrap();
+        let mut iter = bytes.into_iter();
+        let parsed = super::Meta::read(&mut iter).unwrap();
+        let mac_field = parsed.fields.iter().find_map(|f| match f {
+            super::MetaField::Mac { salt, mac } => Some((*salt, *mac)),
+            _ => None,
+        });
+        assert!(mac_field.is_some(), "Mac field should be present after round-trip");
+    }
+
+    #[test]
+    fn to_bytes_with_auth_round_trip_signature() {
+        struct Fake;
+        impl super::Signer for Fake {
+            fn sign(&self, _auth_input: &[u8]) -> super::AuthField {
+                super::AuthField::Signature([0x99_u8; 64])
+            }
+        }
+        let meta = super::Meta::make_v3(Some(4), Some("y.bin".into()), Some(0));
+        let payload = b"DATA";
+        let bytes = meta.to_bytes_with_auth(payload, &Fake).unwrap();
+        let mut iter = bytes.into_iter();
+        let parsed = super::Meta::read(&mut iter).unwrap();
+        let sig = parsed.fields.iter().find_map(|f| match f {
+            super::MetaField::Signature(s) => Some(*s),
+            _ => None,
+        });
+        assert_eq!(sig, Some([0x99_u8; 64]));
+    }
+
+    #[test]
+    fn to_bytes_with_auth_rejects_non_v3() {
+        struct Fake;
+        impl super::Signer for Fake {
+            fn sign(&self, _auth_input: &[u8]) -> super::AuthField {
+                super::AuthField::Signature([0_u8; 64])
+            }
+        }
+        let mut meta = super::Meta::make(Some(1), Some("z.bin".into()), Some(0));
+        // make() returns VERSION_2; the method should refuse to write a v2.
+        meta.version = super::VERSION_2;
+        let err = meta.to_bytes_with_auth(b"x", &Fake).unwrap_err();
+        assert!(matches!(err, super::MetaError::UnsupportedWriteVersion(2)));
     }
 }
