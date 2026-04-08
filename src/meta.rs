@@ -13,6 +13,8 @@ pub(crate) enum MetaTag {
     Filename,
     Hash,
     MetaHash,
+    Mac,
+    Signature,
 }
 
 impl From<MetaTag> for u8 {
@@ -22,6 +24,8 @@ impl From<MetaTag> for u8 {
             MetaTag::Filename => 2,
             MetaTag::Hash => 3,
             MetaTag::MetaHash => 4,
+            MetaTag::Mac => 5,
+            MetaTag::Signature => 6,
         }
     }
 }
@@ -34,6 +38,8 @@ impl TryFrom<u8> for MetaTag {
             2 => Ok(MetaTag::Filename),
             3 => Ok(MetaTag::Hash),
             4 => Ok(MetaTag::MetaHash),
+            5 => Ok(MetaTag::Mac),
+            6 => Ok(MetaTag::Signature),
             _ => Err(()),
         }
     }
@@ -45,6 +51,8 @@ pub enum MetaField {
     Filename(String),
     Hash(u32),
     MetaHash(u32),
+    Mac { salt: [u8; 16], mac: [u8; 32] },
+    Signature([u8; 64]),
 }
 
 pub enum MetaFieldParseResult {
@@ -60,6 +68,8 @@ impl MetaField {
             MetaField::Filename(_) => MetaTag::Filename,
             MetaField::Hash(_) => MetaTag::Hash,
             MetaField::MetaHash(_) => MetaTag::MetaHash,
+            MetaField::Mac { .. } => MetaTag::Mac,
+            MetaField::Signature(_) => MetaTag::Signature,
         }
     }
 
@@ -67,6 +77,8 @@ impl MetaField {
         match self {
             MetaField::Size(_) | MetaField::Hash(_) | MetaField::MetaHash(_) => 4,
             MetaField::Filename(s) => s.len(),
+            MetaField::Mac { .. } => 48,
+            MetaField::Signature(_) => 64,
         }
     }
 
@@ -91,6 +103,11 @@ impl MetaField {
             MetaField::Size(sz) => out.extend(sz.to_le_bytes()),
             MetaField::Filename(s) => out.extend(s.as_bytes()),
             MetaField::Hash(h) | MetaField::MetaHash(h) => out.extend(h.to_le_bytes()),
+            MetaField::Mac { salt, mac } => {
+                out.extend(salt.as_ref());
+                out.extend(mac.as_ref());
+            }
+            MetaField::Signature(sig) => out.extend(sig.as_ref()),
         }
         Ok(())
     }
@@ -145,6 +162,29 @@ impl MetaField {
             MetaTag::Filename => MetaField::Filename(parse_filename(bytes)?),
             MetaTag::Hash => MetaField::Hash(parse_u32_field(&bytes)?),
             MetaTag::MetaHash => MetaField::MetaHash(parse_u32_field(&bytes)?),
+            MetaTag::Mac => {
+                if bytes.len() != 48 {
+                    return Err(MetaError::MalformedField);
+                }
+                let salt: [u8; 16] = bytes
+                    .get(..16)
+                    .and_then(|s| <[u8; 16]>::try_from(s).ok())
+                    .ok_or(MetaError::MalformedField)?;
+                let mac: [u8; 32] = bytes
+                    .get(16..48)
+                    .and_then(|s| <[u8; 32]>::try_from(s).ok())
+                    .ok_or(MetaError::MalformedField)?;
+                MetaField::Mac { salt, mac }
+            }
+            MetaTag::Signature => {
+                if bytes.len() != 64 {
+                    return Err(MetaError::MalformedField);
+                }
+                let sig: [u8; 64] = bytes
+                    .try_into()
+                    .map_err(|_| MetaError::MalformedField)?;
+                MetaField::Signature(sig)
+            }
         };
         Ok(MetaFieldParseResult::Field(field))
     }
@@ -180,6 +220,24 @@ impl MetaField {
     pub fn as_meta_hash(&self) -> Option<u32> {
         if let MetaField::MetaHash(h) = self {
             Some(*h)
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub fn as_mac(&self) -> Option<(&[u8; 16], &[u8; 32])> {
+        if let MetaField::Mac { salt, mac } = self {
+            Some((salt, mac))
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub fn as_signature(&self) -> Option<&[u8; 64]> {
+        if let MetaField::Signature(sig) = self {
+            Some(sig)
         } else {
             None
         }
@@ -240,12 +298,26 @@ impl Meta {
         Ok(())
     }
 
-    fn write_fields_excluding_meta_hash(&self, buf: &mut Vec<u8>) -> Result<(), MetaError> {
+    fn write_fields_excluding_meta_hash_and_auth(&self, buf: &mut Vec<u8>) -> Result<(), MetaError> {
         for field in &self.fields {
-            if field.as_meta_hash().is_some() {
-                continue;
+            match field {
+                MetaField::MetaHash(_) | MetaField::Mac { .. } | MetaField::Signature(_) => {}
+                _ => field.write_into(buf)?,
             }
-            field.write_into(buf)?;
+        }
+        Ok(())
+    }
+
+    fn write_auth_fields(&self, buf: &mut Vec<u8>) -> Result<(), MetaError> {
+        let mut count: usize = 0;
+        for field in &self.fields {
+            if matches!(field, MetaField::Mac { .. } | MetaField::Signature(_)) {
+                field.write_into(buf)?;
+                count = count.saturating_add(1);
+            }
+        }
+        if count > 1 {
+            return Err(MetaError::MultipleAuthFields);
         }
         Ok(())
     }
@@ -268,9 +340,10 @@ impl Meta {
         let mut result = Vec::with_capacity(64);
         result.extend(signature.to_le_bytes());
         if self.version == VERSION_3 {
-            self.write_fields_excluding_meta_hash(&mut result)?;
+            self.write_fields_excluding_meta_hash_and_auth(&mut result)?;
             let crc = crc32fast::hash(&result);
             MetaField::MetaHash(crc).write_into(&mut result)?;
+            self.write_auth_fields(&mut result)?;
         } else {
             self.write_all_fields(&mut result)?;
         }
@@ -475,12 +548,14 @@ pub enum MetaError {
     MalformedField,
     #[error("Metadata field value exceeds maximum TLV length")]
     FieldTooLong,
+    #[error("Multiple auth fields in container")]
+    MultipleAuthFields,
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{Meta, MAGIC, VERSION_1, VERSION_2};
+    use super::{Meta, MetaField, MAGIC, VERSION_1, VERSION_2, VERSION_3};
     use rstest::rstest;
 
     fn build_v1_bytes() -> Vec<u8> {
@@ -558,6 +633,129 @@ mod tests {
         bytes
     }
 
+    fn build_v3_with_mac_roundtrip() -> Vec<u8> {
+        let mut m = Meta::make_v3(Some(7), Some("a.bin".into()), Some(0));
+        m.fields.push(MetaField::Mac {
+            salt: [0x55_u8; 16],
+            mac: [0x77_u8; 32],
+        });
+        m.to_bytes().unwrap()
+    }
+
+    fn build_v3_with_sig_roundtrip() -> Vec<u8> {
+        let mut m = Meta::make_v3(Some(7), Some("a.bin".into()), Some(0));
+        m.fields.push(MetaField::Signature([0xAB_u8; 64]));
+        m.to_bytes().unwrap()
+    }
+
+    fn build_v3_with_mac_tampered_prefix_byte() -> Vec<u8> {
+        let mut bytes = build_v3_with_mac_roundtrip();
+        if let Some(b) = bytes.get_mut(8) {
+            *b ^= 0x01;
+        }
+        bytes
+    }
+
+    fn build_v3_with_mac_tampered_mac_value_byte() -> Vec<u8> {
+        let mut bytes = build_v3_with_mac_roundtrip();
+        let len = bytes.len();
+        if let Some(idx) = len.checked_sub(4) {
+            if let Some(b) = bytes.get_mut(idx) {
+                *b ^= 0x01;
+            }
+        }
+        bytes
+    }
+
+    fn build_v3_with_mac_tampered_salt_byte() -> Vec<u8> {
+        let mut bytes = build_v3_with_mac_roundtrip();
+        let pos_opt = bytes.windows(2).position(|w| {
+            w.first().copied() == Some(5_u8) && w.get(1).copied() == Some(48_u8)
+        });
+        if let Some(pos) = pos_opt {
+            if let Some(idx) = pos.checked_add(2) {
+                if let Some(b) = bytes.get_mut(idx) {
+                    *b ^= 0x01;
+                }
+            }
+        }
+        bytes
+    }
+
+    fn build_v3_signed_read_by_unsigned_path() -> Vec<u8> {
+        build_v3_with_mac_roundtrip()
+    }
+
+    fn build_v3_unknown_tlv_after_signature() -> Vec<u8> {
+        let mut m = Meta::make_v3(Some(7), Some("a.bin".into()), Some(0));
+        m.fields.push(MetaField::Signature([0xCD_u8; 64]));
+        let mut bytes = m.to_bytes().unwrap();
+        if let Some(new_len) = bytes.len().checked_sub(2) {
+            bytes.truncate(new_len);
+        }
+        bytes.push(0x7F);
+        bytes.push(3);
+        bytes.extend([0xAA_u8, 0xBB, 0xCC]);
+        bytes.push(0);
+        bytes.push(0);
+        bytes
+    }
+
+    fn build_v3_signature_truncated_in_value() -> Vec<u8> {
+        let mut m = Meta::make_v3(Some(7), Some("a.bin".into()), Some(0));
+        m.fields.push(MetaField::Signature([0xCD_u8; 64]));
+        let mut bytes = m.to_bytes().unwrap();
+        if let Some(new_len) = bytes.len().checked_sub(40) {
+            bytes.truncate(new_len);
+        }
+        bytes
+    }
+
+    fn build_v3_mac_wrong_length_short() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let signature = (MAGIC << 3_u32) | u16::from(VERSION_3);
+        bytes.extend(signature.to_le_bytes());
+        bytes.push(1);
+        bytes.push(4);
+        bytes.extend(7_u32.to_le_bytes());
+        bytes.push(5); // Mac tag
+        bytes.push(32); // wrong length
+        bytes.extend([0_u8; 32]);
+        bytes.push(0);
+        bytes.push(0);
+        bytes
+    }
+
+    fn build_v3_mac_wrong_length_long() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let signature = (MAGIC << 3_u32) | u16::from(VERSION_3);
+        bytes.extend(signature.to_le_bytes());
+        bytes.push(1);
+        bytes.push(4);
+        bytes.extend(7_u32.to_le_bytes());
+        bytes.push(5);
+        bytes.push(64);
+        bytes.extend([0_u8; 64]);
+        bytes.push(0);
+        bytes.push(0);
+        bytes
+    }
+
+    fn build_v3_signature_wrong_length() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let signature = (MAGIC << 3_u32) | u16::from(VERSION_3);
+        bytes.extend(signature.to_le_bytes());
+        bytes.push(1);
+        bytes.push(4);
+        bytes.extend(7_u32.to_le_bytes());
+        bytes.push(6);
+        bytes.push(32);
+        bytes.extend([0_u8; 32]);
+        bytes.push(0);
+        bytes.push(0);
+        bytes
+    }
+
     #[rstest]
     #[case::v1("v1", build_v1_bytes())]
     #[case::v2_roundtrip("v2_roundtrip", build_v2_roundtrip())]
@@ -566,6 +764,17 @@ mod tests {
     #[case::v3_tampered("v3_tampered", build_v3_tampered())]
     #[case::v2_bad_utf8("v2_bad_utf8", build_v2_bad_utf8())]
     #[case::v2_bad_size("v2_bad_size", build_v2_bad_size())]
+    #[case::v3_with_mac_roundtrip("v3_with_mac_roundtrip", build_v3_with_mac_roundtrip())]
+    #[case::v3_with_sig_roundtrip("v3_with_sig_roundtrip", build_v3_with_sig_roundtrip())]
+    #[case::v3_with_mac_tampered_prefix_byte("v3_with_mac_tampered_prefix_byte", build_v3_with_mac_tampered_prefix_byte())]
+    #[case::v3_with_mac_tampered_mac_value_byte("v3_with_mac_tampered_mac_value_byte", build_v3_with_mac_tampered_mac_value_byte())]
+    #[case::v3_with_mac_tampered_salt_byte("v3_with_mac_tampered_salt_byte", build_v3_with_mac_tampered_salt_byte())]
+    #[case::v3_signed_read_by_unsigned_path("v3_signed_read_by_unsigned_path", build_v3_signed_read_by_unsigned_path())]
+    #[case::v3_unknown_tlv_after_signature("v3_unknown_tlv_after_signature", build_v3_unknown_tlv_after_signature())]
+    #[case::v3_signature_truncated_in_value("v3_signature_truncated_in_value", build_v3_signature_truncated_in_value())]
+    #[case::v3_mac_wrong_length_short("v3_mac_wrong_length_short", build_v3_mac_wrong_length_short())]
+    #[case::v3_mac_wrong_length_long("v3_mac_wrong_length_long", build_v3_mac_wrong_length_long())]
+    #[case::v3_signature_wrong_length("v3_signature_wrong_length", build_v3_signature_wrong_length())]
     fn meta_parse(#[case] name: &str, #[case] bytes: Vec<u8>) {
         let mut iter = bytes.into_iter();
         insta::assert_debug_snapshot!(name, Meta::read(&mut iter));
