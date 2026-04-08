@@ -61,6 +61,35 @@ fn constant_time_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
     diff == 0
 }
 
+use crate::meta::{AuthField, Signer};
+
+pub struct PskSigner {
+    key: [u8; 32],
+    salt: [u8; 16],
+}
+
+impl PskSigner {
+    /// Build a signer from a passphrase. Generates a fresh salt and derives
+    /// the Argon2id key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KeyError::Rng`] if the OS RNG fails, or
+    /// [`KeyError::Argon2Params`] / [`KeyError::Argon2Hash`] from the KDF.
+    pub fn new(passphrase: &[u8]) -> Result<Self, KeyError> {
+        let salt = fresh_salt()?;
+        let key = derive_psk(passphrase, &salt)?;
+        Ok(Self { key, salt })
+    }
+}
+
+impl Signer for PskSigner {
+    fn sign(&self, auth_input: &[u8]) -> AuthField {
+        let mac = psk_mac(&self.key, auth_input);
+        AuthField::Mac { salt: self.salt, mac }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
