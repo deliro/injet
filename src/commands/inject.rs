@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{stdout, BufReader, BufWriter, IsTerminal, Read, Seek, Write};
+use std::io::{stdout, BufWriter, IsTerminal, Write};
 use std::path::Path;
 
 use image::codecs::png::{FilterType, PngEncoder};
@@ -11,7 +11,6 @@ use crate::lsb::{gen_dots, to_bits};
 use crate::meta::{Meta, MetaError};
 
 const MAX_FILENAME_LEN: usize = 255;
-const HASH_BUFFER_SIZE: usize = 8192;
 
 #[derive(Debug, Error)]
 pub enum InjectError {
@@ -33,6 +32,26 @@ pub enum InjectError {
     FilenameOverflow,
     #[error("Failed to encode metadata: {0}")]
     Meta(#[from] MetaError),
+    #[error("Signing requires metadata; use --write-meta=true (the default) when passing --psk-* or --sign-key")]
+    SigningRequiresMetadata,
+    #[error("Key error: {0}")]
+    Key(#[from] crate::auth::KeyError),
+}
+
+impl InjectError {
+    #[must_use]
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            InjectError::SigningRequiresMetadata | InjectError::Key(_) => 2,
+            InjectError::CannotOpenContainer
+            | InjectError::CannotOpenPayload
+            | InjectError::PayloadTooLarge
+            | InjectError::ExceededSize { .. }
+            | InjectError::CannotSave(_)
+            | InjectError::FilenameOverflow
+            | InjectError::Meta(_) => 1,
+        }
+    }
 }
 
 fn make_writer(dest: Option<&Path>, default: impl AsRef<Path>) -> Result<Box<dyn Write>, String> {
@@ -46,23 +65,6 @@ fn make_writer(dest: Option<&Path>, default: impl AsRef<Path>) -> Result<Box<dyn
     Ok(writer)
 }
 
-fn hash_payload(payload: &File) -> Result<u32, InjectError> {
-    let mut hasher = crc32fast::Hasher::new();
-    let mut reader = BufReader::new(payload);
-    let mut buf = [0_u8; HASH_BUFFER_SIZE];
-    loop {
-        let n = reader
-            .read(&mut buf)
-            .map_err(|_| InjectError::CannotOpenPayload)?;
-        if n == 0 {
-            break;
-        }
-        let chunk = buf.get(..n).ok_or(InjectError::CannotOpenPayload)?;
-        hasher.update(chunk);
-    }
-    Ok(hasher.finalize())
-}
-
 /// Injects a file into a PNG container using LSB encoding.
 ///
 /// # Errors
@@ -70,11 +72,14 @@ fn hash_payload(payload: &File) -> Result<u32, InjectError> {
 /// Returns an [`InjectError`] when the container or payload cannot be opened, the payload
 /// does not fit, the filename is invalid, or the output cannot be written.
 pub fn inject(args: &InjectArgs) -> Result<(), InjectError> {
+    if !args.write_meta && args.auth_spec().is_some() {
+        return Err(InjectError::SigningRequiresMetadata);
+    }
+
     let mut img = image::open(&args.container)
         .map_err(|_| InjectError::CannotOpenContainer)?
         .into_rgba8();
 
-    let payload = File::open(&args.payload).map_err(|_| InjectError::CannotOpenPayload)?;
     let (width, height) = img.dimensions();
     let pixel_count = u64::from(width).saturating_mul(u64::from(height));
     let max_payload_bytes_u64 = pixel_count
@@ -83,11 +88,10 @@ pub fn inject(args: &InjectArgs) -> Result<(), InjectError> {
         .ok_or(InjectError::CannotOpenContainer)?;
     let max_payload_size = u32::try_from(max_payload_bytes_u64).unwrap_or(u32::MAX);
 
-    let payload_meta = payload
-        .metadata()
-        .map_err(|_| InjectError::CannotOpenPayload)?;
+    let payload_bytes: Vec<u8> =
+        std::fs::read(&args.payload).map_err(|_| InjectError::CannotOpenPayload)?;
     let payload_size =
-        u32::try_from(payload_meta.len()).map_err(|_| InjectError::PayloadTooLarge)?;
+        u32::try_from(payload_bytes.len()).map_err(|_| InjectError::PayloadTooLarge)?;
 
     let meta_bytes: Vec<u8> = if args.write_meta {
         let filename = args
@@ -99,12 +103,25 @@ pub fn inject(args: &InjectArgs) -> Result<(), InjectError> {
                 return Err(InjectError::FilenameOverflow);
             }
         }
-        // Calculate crc32 by streaming the payload, then rewind for the bit pass.
-        let hash = hash_payload(&payload)?;
-        (&payload)
-            .rewind()
-            .map_err(|_| InjectError::CannotOpenPayload)?;
-        Meta::make_v3(Some(payload_size), filename, Some(hash)).to_bytes()?
+        let hash = crc32fast::hash(&payload_bytes);
+        let meta = Meta::make_v3(Some(payload_size), filename, Some(hash));
+        match args.auth_spec() {
+            None => meta.to_bytes()?,
+            Some(crate::auth::AuthSpec::Psk(src)) => {
+                let pass = crate::auth::passphrase::load(&src)?;
+                let signer = crate::auth::PskSigner::new(pass.as_slice())?;
+                meta.to_bytes_with_auth(&payload_bytes, &signer)?
+            }
+            Some(crate::auth::AuthSpec::Ed25519 {
+                key_path,
+                key_passphrase,
+            }) => {
+                let signing =
+                    crate::auth::ed25519::load_signing_key(&key_path, key_passphrase.as_ref())?;
+                let signer = crate::auth::Ed25519Signer::new(signing);
+                meta.to_bytes_with_auth(&payload_bytes, &signer)?
+            }
+        }
     } else {
         Vec::new()
     };
@@ -122,10 +139,7 @@ pub fn inject(args: &InjectArgs) -> Result<(), InjectError> {
     }
 
     let meta_bits = meta_bytes.into_iter().flat_map(to_bits);
-    let payload_bits = BufReader::new(payload)
-        .bytes()
-        .filter_map(Result::ok)
-        .flat_map(to_bits);
+    let payload_bits = payload_bytes.into_iter().flat_map(to_bits);
     let mut bit_iter = meta_bits.chain(payload_bits);
     let color_coords = gen_dots(width, height, args.seed.as_ref());
     // Iterate over all coordinates, modifying only the required number of pixels.

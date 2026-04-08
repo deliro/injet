@@ -16,12 +16,13 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() {
     let cli = Cli::parse();
-    if let Err(e) = match &cli.command {
-        Commands::Inject(args) => inject::inject(args).map_err(|e| e.to_string()),
-        Commands::Extract(args) => extract::extract(args).map_err(|e| e.to_string()),
-        Commands::Inspect(args) => inspect::inspect(args).map_err(|e| e.to_string()),
-    } {
-        eprintln!("{e}");
-        exit(1);
+    let result: Result<(), (String, i32)> = match &cli.command {
+        Commands::Inject(args) => inject::inject(args).map_err(|e| (e.to_string(), e.exit_code())),
+        Commands::Extract(args) => extract::extract(args).map_err(|e| (e.to_string(), 1_i32)),
+        Commands::Inspect(args) => inspect::inspect(args).map_err(|e| (e.to_string(), 1_i32)),
+    };
+    if let Err((msg, code)) = result {
+        eprintln!("{msg}");
+        exit(code);
     }
 }
