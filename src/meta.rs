@@ -199,9 +199,7 @@ impl MetaField {
                 if bytes.len() != 64 {
                     return Err(MetaError::MalformedField);
                 }
-                let sig: [u8; 64] = bytes
-                    .try_into()
-                    .map_err(|_| MetaError::MalformedField)?;
+                let sig: [u8; 64] = bytes.try_into().map_err(|_| MetaError::MalformedField)?;
                 MetaField::Signature(sig)
             }
         };
@@ -322,7 +320,10 @@ impl Meta {
         Ok(())
     }
 
-    fn write_fields_excluding_meta_hash_and_auth(&self, buf: &mut Vec<u8>) -> Result<(), MetaError> {
+    fn write_fields_excluding_meta_hash_and_auth(
+        &self,
+        buf: &mut Vec<u8>,
+    ) -> Result<(), MetaError> {
         for field in &self.fields {
             match field {
                 MetaField::MetaHash(_) | MetaField::Mac { .. } | MetaField::Signature(_) => {}
@@ -402,9 +403,8 @@ impl Meta {
         let crc = crc32fast::hash(&result);
         MetaField::MetaHash(crc).write_into(&mut result)?;
         // auth_input = prefix bytes (header up to and including MetaHash TLV) || payload
-        let mut auth_input: Vec<u8> = Vec::with_capacity(
-            result.len().saturating_add(payload.len()),
-        );
+        let mut auth_input: Vec<u8> =
+            Vec::with_capacity(result.len().saturating_add(payload.len()));
         auth_input.extend_from_slice(&result);
         auth_input.extend_from_slice(payload);
         let auth_field = signer.sign(&auth_input);
@@ -478,7 +478,11 @@ impl Meta {
         match version {
             VERSION_1 => {
                 let fields = MetaField::from_v1_header(value)?;
-                Ok(Meta { version, fields, auth_prefix: None })
+                Ok(Meta {
+                    version,
+                    fields,
+                    auth_prefix: None,
+                })
             }
             VERSION_2 => {
                 let mut fields = Vec::new();
@@ -489,7 +493,11 @@ impl Meta {
                         MetaFieldParseResult::Skip => {}
                     }
                 }
-                Ok(Meta { version, fields, auth_prefix: None })
+                Ok(Meta {
+                    version,
+                    fields,
+                    auth_prefix: None,
+                })
             }
             VERSION_3 => Self::read_v3(value, [sig0, sig1]),
             v => Err(MetaError::UnsupportedVersion(v)),
@@ -747,9 +755,9 @@ mod tests {
 
     fn build_v3_with_mac_tampered_salt_byte() -> Vec<u8> {
         let mut bytes = build_v3_with_mac_roundtrip();
-        let pos_opt = bytes.windows(2).position(|w| {
-            w.first().copied() == Some(5_u8) && w.get(1).copied() == Some(48_u8)
-        });
+        let pos_opt = bytes
+            .windows(2)
+            .position(|w| w.first().copied() == Some(5_u8) && w.get(1).copied() == Some(48_u8));
         if let Some(pos) = pos_opt {
             if let Some(idx) = pos.checked_add(2) {
                 if let Some(b) = bytes.get_mut(idx) {
@@ -872,15 +880,39 @@ mod tests {
     #[case::v2_bad_size("v2_bad_size", build_v2_bad_size())]
     #[case::v3_with_mac_roundtrip("v3_with_mac_roundtrip", build_v3_with_mac_roundtrip())]
     #[case::v3_with_sig_roundtrip("v3_with_sig_roundtrip", build_v3_with_sig_roundtrip())]
-    #[case::v3_with_mac_tampered_prefix_byte("v3_with_mac_tampered_prefix_byte", build_v3_with_mac_tampered_prefix_byte())]
-    #[case::v3_with_mac_tampered_mac_value_byte("v3_with_mac_tampered_mac_value_byte", build_v3_with_mac_tampered_mac_value_byte())]
-    #[case::v3_with_mac_tampered_salt_byte("v3_with_mac_tampered_salt_byte", build_v3_with_mac_tampered_salt_byte())]
-    #[case::v3_signed_read_by_unsigned_path("v3_signed_read_by_unsigned_path", build_v3_signed_read_by_unsigned_path())]
-    #[case::v3_unknown_tlv_after_signature("v3_unknown_tlv_after_signature", build_v3_unknown_tlv_after_signature())]
-    #[case::v3_signature_truncated_in_value("v3_signature_truncated_in_value", build_v3_signature_truncated_in_value())]
-    #[case::v3_mac_wrong_length_short("v3_mac_wrong_length_short", build_v3_mac_wrong_length_short())]
+    #[case::v3_with_mac_tampered_prefix_byte(
+        "v3_with_mac_tampered_prefix_byte",
+        build_v3_with_mac_tampered_prefix_byte()
+    )]
+    #[case::v3_with_mac_tampered_mac_value_byte(
+        "v3_with_mac_tampered_mac_value_byte",
+        build_v3_with_mac_tampered_mac_value_byte()
+    )]
+    #[case::v3_with_mac_tampered_salt_byte(
+        "v3_with_mac_tampered_salt_byte",
+        build_v3_with_mac_tampered_salt_byte()
+    )]
+    #[case::v3_signed_read_by_unsigned_path(
+        "v3_signed_read_by_unsigned_path",
+        build_v3_signed_read_by_unsigned_path()
+    )]
+    #[case::v3_unknown_tlv_after_signature(
+        "v3_unknown_tlv_after_signature",
+        build_v3_unknown_tlv_after_signature()
+    )]
+    #[case::v3_signature_truncated_in_value(
+        "v3_signature_truncated_in_value",
+        build_v3_signature_truncated_in_value()
+    )]
+    #[case::v3_mac_wrong_length_short(
+        "v3_mac_wrong_length_short",
+        build_v3_mac_wrong_length_short()
+    )]
     #[case::v3_mac_wrong_length_long("v3_mac_wrong_length_long", build_v3_mac_wrong_length_long())]
-    #[case::v3_signature_wrong_length("v3_signature_wrong_length", build_v3_signature_wrong_length())]
+    #[case::v3_signature_wrong_length(
+        "v3_signature_wrong_length",
+        build_v3_signature_wrong_length()
+    )]
     #[case::v3_with_both_mac_and_sig("v3_with_both_mac_and_sig", build_v3_with_both_mac_and_sig())]
     fn meta_parse(#[case] name: &str, #[case] bytes: Vec<u8>) {
         let mut iter = bytes.into_iter();
@@ -912,7 +944,10 @@ mod tests {
             super::MetaField::Mac { salt, mac } => Some((*salt, *mac)),
             _ => None,
         });
-        assert!(mac_field.is_some(), "Mac field should be present after round-trip");
+        assert!(
+            mac_field.is_some(),
+            "Mac field should be present after round-trip"
+        );
     }
 
     #[test]

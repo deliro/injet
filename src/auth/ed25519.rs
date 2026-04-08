@@ -68,7 +68,9 @@ pub fn load_signing_key(
             }
             crate::auth::passphrase::load(&PassphraseSource::Prompt)?
         };
-        private = private.decrypt(&pass).map_err(|_| KeyError::DecryptFailed)?;
+        private = private
+            .decrypt(&pass)
+            .map_err(|_| KeyError::DecryptFailed)?;
     }
     if private.algorithm() != Algorithm::Ed25519 {
         return Err(KeyError::UnsupportedAlgorithm);
@@ -254,8 +256,7 @@ mod tests {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         f.write_all(b"wrong\n").unwrap();
         let src = crate::auth::passphrase::PassphraseSource::File(f.path().to_path_buf());
-        let err =
-            load_signing_key(&fixture("signer_ed25519_encrypted"), Some(&src)).unwrap_err();
+        let err = load_signing_key(&fixture("signer_ed25519_encrypted"), Some(&src)).unwrap_err();
         assert!(matches!(err, KeyError::DecryptFailed));
     }
 

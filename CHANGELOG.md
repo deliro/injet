@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [1.1.0] - 2026-04-08
 
 ### Added
 - Optional cryptographic authentication for containers via two opt-in modes:

@@ -146,10 +146,12 @@ impl InjectArgs {
         if let Some(src) = self.psk.clone().into_source() {
             return Some(crate::auth::AuthSpec::Psk(src));
         }
-        self.sign_key.clone().map(|key_path| crate::auth::AuthSpec::Ed25519 {
-            key_path,
-            key_passphrase: self.sign_key_passphrase.clone().into_source(),
-        })
+        self.sign_key
+            .clone()
+            .map(|key_path| crate::auth::AuthSpec::Ed25519 {
+                key_path,
+                key_passphrase: self.sign_key_passphrase.clone().into_source(),
+            })
     }
 }
 

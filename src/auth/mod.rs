@@ -91,9 +91,12 @@ pub fn pair_up(spec: &VerifySpec, fields: &[MetaField]) -> Result<VerifyJob, Aut
                     _ => None,
                 })
                 .ok_or(AuthError::MissingAuthField)?;
-            let passphrase =
-                passphrase::load(src).map_err(|_| AuthError::VerificationFailed)?;
-            Ok(VerifyJob::Psk { passphrase, salt, mac })
+            let passphrase = passphrase::load(src).map_err(|_| AuthError::VerificationFailed)?;
+            Ok(VerifyJob::Psk {
+                passphrase,
+                salt,
+                mac,
+            })
         }
         VerifySpec::Ed25519Path(path) => {
             let sig = signature_from_fields(fields)?;
@@ -103,8 +106,8 @@ pub fn pair_up(spec: &VerifySpec, fields: &[MetaField]) -> Result<VerifyJob, Aut
         }
         VerifySpec::Ed25519Inline(line) => {
             let sig = signature_from_fields(fields)?;
-            let pubkey = ed25519::parse_verifying_key(line)
-                .map_err(|_| AuthError::VerificationFailed)?;
+            let pubkey =
+                ed25519::parse_verifying_key(line).map_err(|_| AuthError::VerificationFailed)?;
             Ok(VerifyJob::Ed25519 { pubkey, sig })
         }
     }
