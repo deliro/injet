@@ -1,6 +1,11 @@
+use std::path::{Path, PathBuf};
+
 use ed25519_dalek::{Signature, Signer as _, SigningKey, VerifyingKey};
+use ssh_key::{Algorithm, PrivateKey, PublicKey};
+use zeroize::Zeroizing;
 
 use crate::auth::error::KeyError;
+use crate::auth::passphrase::PassphraseSource;
 
 /// Sign `auth_input` with an Ed25519 signing key.
 #[must_use]
@@ -31,10 +36,105 @@ pub fn verifying_key_from_bytes(bytes: &[u8; 32]) -> Result<VerifyingKey, KeyErr
     VerifyingKey::from_bytes(bytes).map_err(|_| KeyError::UnsupportedAlgorithm)
 }
 
+/// Load an OpenSSH Ed25519 private key from disk.
+///
+/// If the key is encrypted, decrypts it using the supplied passphrase
+/// source. If `encrypted_key_passphrase` is `None` and the key is
+/// encrypted, falls back to a TTY prompt; if no TTY is available the
+/// returned error is [`KeyError::EncryptedKeyNoPassphrase`].
+///
+/// # Errors
+///
+/// Returns [`KeyError`] variants for I/O failures, parse failures,
+/// non-Ed25519 algorithms, and decryption failures.
+pub fn load_signing_key(
+    path: &Path,
+    encrypted_key_passphrase: Option<&PassphraseSource>,
+) -> Result<SigningKey, KeyError> {
+    let pem = std::fs::read(path).map_err(|source| KeyError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut private = PrivateKey::from_openssh(&pem).map_err(|source| KeyError::OpenSshParse {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if private.is_encrypted() {
+        let pass = if let Some(src) = encrypted_key_passphrase {
+            crate::auth::passphrase::load(src)?
+        } else {
+            if !is_tty() {
+                return Err(KeyError::EncryptedKeyNoPassphrase);
+            }
+            crate::auth::passphrase::load(&PassphraseSource::Prompt)?
+        };
+        private = private.decrypt(&pass).map_err(|_| KeyError::DecryptFailed)?;
+    }
+    if private.algorithm() != Algorithm::Ed25519 {
+        return Err(KeyError::UnsupportedAlgorithm);
+    }
+    let keypair = private
+        .key_data()
+        .ed25519()
+        .ok_or(KeyError::UnsupportedAlgorithm)?;
+    let seed_bytes: [u8; 32] = keypair.private.to_bytes();
+    let seed = Zeroizing::new(seed_bytes);
+    Ok(signing_key_from_seed(&seed))
+}
+
+/// Load an OpenSSH Ed25519 public key from a file.
+///
+/// # Errors
+///
+/// Returns [`KeyError`] for I/O, parse, or algorithm errors.
+pub fn load_verifying_key_from_file(path: &Path) -> Result<VerifyingKey, KeyError> {
+    let public = PublicKey::read_openssh_file(path).map_err(|source| KeyError::OpenSshParse {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    public_key_to_verifying(&public, path)
+}
+
+/// Parse an `ssh-ed25519 AAAA... [comment]` line into a `VerifyingKey`.
+///
+/// # Errors
+///
+/// Returns parse / algorithm errors as [`KeyError`].
+pub fn parse_verifying_key(line: &str) -> Result<VerifyingKey, KeyError> {
+    let public = PublicKey::from_openssh(line.trim()).map_err(|source| KeyError::OpenSshParse {
+        path: PathBuf::new(),
+        source,
+    })?;
+    public_key_to_verifying(&public, Path::new(""))
+}
+
+fn public_key_to_verifying(public: &PublicKey, _origin: &Path) -> Result<VerifyingKey, KeyError> {
+    if public.algorithm() != Algorithm::Ed25519 {
+        return Err(KeyError::UnsupportedAlgorithm);
+    }
+    let ed = public
+        .key_data()
+        .ed25519()
+        .ok_or(KeyError::UnsupportedAlgorithm)?;
+    let bytes: [u8; 32] = ed.0;
+    verifying_key_from_bytes(&bytes)
+}
+
+fn is_tty() -> bool {
+    use std::io::IsTerminal as _;
+    std::io::stdin().is_terminal()
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{sign_ed25519, signing_key_from_seed, verify_ed25519, verifying_key_from_bytes};
+    use std::path::PathBuf;
+
+    use super::{
+        load_signing_key, load_verifying_key_from_file, parse_verifying_key, sign_ed25519,
+        signing_key_from_seed, verify_ed25519, verifying_key_from_bytes,
+    };
+    use crate::auth::error::KeyError;
 
     // RFC 8032 test vector 1: empty message.
     const RFC8032_SEED: [u8; 32] = [
@@ -89,5 +189,64 @@ mod tests {
         bad[0] = 0x01;
         bad[2] = 0xAB;
         assert!(verifying_key_from_bytes(&bad).is_err());
+    }
+
+    fn fixture(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/keys")
+            .join(name)
+    }
+
+    #[test]
+    fn load_unencrypted_private_key() {
+        let key = load_signing_key(&fixture("signer_ed25519"), None).unwrap();
+        let sig = sign_ed25519(&key, b"data");
+        assert!(verify_ed25519(&key.verifying_key(), b"data", &sig));
+    }
+
+    #[test]
+    fn load_public_key_file() {
+        let pubkey = load_verifying_key_from_file(&fixture("signer_ed25519.pub")).unwrap();
+        let signing = load_signing_key(&fixture("signer_ed25519"), None).unwrap();
+        assert_eq!(pubkey.to_bytes(), signing.verifying_key().to_bytes());
+    }
+
+    #[test]
+    fn parse_public_key_line() {
+        let line = std::fs::read_to_string(fixture("signer_ed25519.pub")).unwrap();
+        let pubkey = parse_verifying_key(&line).unwrap();
+        assert_eq!(pubkey.to_bytes().len(), 32);
+    }
+
+    #[test]
+    fn load_encrypted_private_key_with_passphrase_file() {
+        use std::io::Write as _;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(b"test-passphrase\n").unwrap();
+        let src = crate::auth::passphrase::PassphraseSource::File(f.path().to_path_buf());
+        let key = load_signing_key(&fixture("signer_ed25519_encrypted"), Some(&src)).unwrap();
+        let sig = sign_ed25519(&key, b"data");
+        assert!(verify_ed25519(&key.verifying_key(), b"data", &sig));
+    }
+
+    #[test]
+    fn load_encrypted_private_key_wrong_passphrase() {
+        use std::io::Write as _;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(b"wrong\n").unwrap();
+        let src = crate::auth::passphrase::PassphraseSource::File(f.path().to_path_buf());
+        let err =
+            load_signing_key(&fixture("signer_ed25519_encrypted"), Some(&src)).unwrap_err();
+        assert!(matches!(err, KeyError::DecryptFailed));
+    }
+
+    #[test]
+    fn unsupported_algorithm_rejected() {
+        let rsa_pub = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ== test";
+        let res = parse_verifying_key(rsa_pub);
+        assert!(matches!(
+            res,
+            Err(KeyError::OpenSshParse { .. } | KeyError::UnsupportedAlgorithm)
+        ));
     }
 }
